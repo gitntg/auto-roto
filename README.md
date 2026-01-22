@@ -88,10 +88,19 @@ pip install -r requirements.txt
 ### 2. Basic Usage
 
 ```bash
-# RECOMMENDED: Full pipeline (SAM2 + Depth Refinement)
+# RECOMMENDED: V5 Pipeline (Best Quality)
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
+
+# V5 with quality preset
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
+
+# V5 for PNG sequence
+python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output
+
+# Original pipeline (SAM2 + Depth only)
 python full_pipeline.py --input video.mp4 --prompt "person" --output ./output
 
-# SAM2 only (faster, still good quality)
+# SAM2 only (fastest)
 python auto_roto.py --input video.mp4 --prompt "person" --output ./output
 
 # Multiple objects
@@ -117,6 +126,51 @@ Or use the automated full pipeline:
 ```bash
 python full_pipeline.py --input video.mp4 --prompt "person" --output ./output
 ```
+
+---
+
+## 🎬 V5 Pipeline (NEW - Best Quality)
+
+The v5 pipeline adds professional VFX quality enhancements:
+
+```
+SAM2 → Depth → Edge Refine → Temporal Smooth → Matte Combine → Final
+```
+
+### Quality Presets
+
+| Preset | SAM Model | Depth Model | Temporal Window | Use Case |
+|--------|-----------|-------------|-----------------|----------|
+| draft | tiny | small | 3 frames | Quick preview |
+| standard | base_plus | base | 5 frames | Production (default) |
+| high | large | large | 7 frames | Hero shots |
+| ultra | large | large | 9 frames | Maximum quality |
+
+### V5 Specific Options
+
+```bash
+# High quality with all enhancements
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
+
+# Skip temporal smoothing (faster)
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --skip-temporal
+
+# Custom edge settings
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output \
+    --edge-softness 1.5 --core-shrink 5 --despill 0.7
+
+# Keep intermediate files for debugging
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --keep-intermediate
+```
+
+### V5 New Features
+
+- **Subpixel Edge Detection**: Laplacian-of-Gaussian for precise edge localization
+- **Color Difference Keying**: Primatte/Keylight-style edge color sampling
+- **Temporal Coherence**: Optical flow-based anti-flicker
+- **Multi-Layer Mattes**: Core + Detail + Soft Edge architecture
+- **Professional Despill**: Complementary color suppression
+- **Premultiplied Alpha**: Proper compositing math
 
 ---
 
