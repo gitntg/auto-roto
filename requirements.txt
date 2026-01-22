@@ -1,0 +1,69 @@
+# =============================================================================
+# AUTO-ROTO Requirements
+# =============================================================================
+# 
+# Core dependencies for production-grade auto-rotoscoping
+#
+# Install with: pip install -r requirements.txt
+# 
+# For PyTorch with CUDA, install separately first:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+# =============================================================================
+
+# Core ML framework (install with CUDA separately if needed)
+# torch>=2.5.1
+# torchvision>=0.20.1
+
+# Image processing
+numpy>=1.24.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# Scientific computing
+scipy>=1.11.0
+
+# Progress bars and CLI
+tqdm>=4.65.0
+rich>=13.0.0
+
+# Visualization (for previews)
+matplotlib>=3.7.0
+
+# Network requests (for downloading models)
+requests>=2.31.0
+
+# Optional: EXR support (may need system libraries)
+# Install OpenEXR system library first:
+#   Ubuntu: sudo apt-get install libopenexr-dev
+#   macOS: brew install openexr
+# OpenEXR>=3.2.0
+
+# Optional: Better guided filter (part of opencv-contrib)
+# opencv-contrib-python>=4.8.0
+
+# Hugging Face (for easy model loading)
+huggingface_hub>=0.19.0
+
+# For image sequence handling
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.8
+
+# Type hints and dataclasses (built-in for Python 3.10+)
+# typing-extensions>=4.5.0
+
+# =============================================================================
+# SAM2 and GroundingDINO
+# =============================================================================
+# 
+# These must be installed from source:
+#
+# SAM2:
+#   git clone https://github.com/facebookresearch/sam2.git
+#   cd sam2 && pip install -e .
+#
+# GroundingDINO (optional, for text prompts):
+#   git clone https://github.com/IDEA-Research/GroundingDINO.git
+#   cd GroundingDINO && pip install -e .
+#
+# =============================================================================
