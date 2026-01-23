@@ -54,7 +54,7 @@ class TrimapConfig:
     """
 
     # Core foreground (eroded SAM2 mask)
-    core_erosion: int = 10          # Pixels to erode for definite foreground
+    core_erosion: int = 5           # Pixels to erode for definite foreground (reduced from 10 to prevent gap)
 
     # Legacy mode: fixed dilation (used when adaptive_mode=False)
     unknown_dilation: int = 25      # Fixed dilation for legacy fallback
@@ -90,18 +90,27 @@ class TrimapConfig:
     use_linear_colorspace: bool = True  # Convert sRGB to linear for processing
 
     # === ADAPTIVE MODE (Formulaic Distance Approach) ===
-    # Instead of hard-coded dilation, use depth gradient magnitude for local variance
+    # Instead of hard-coded values, use depth gradient magnitude for local variance
     adaptive_mode: bool = True          # Adaptive trimap is now the default
-    adaptive_base_px: float = 2.0       # Minimum reach (smooth regions like shoulders)
-    adaptive_max_px: float = 60.0       # Maximum reach (complex regions like hair)
     adaptive_blur_kernel: int = 21      # Gaussian blur for complexity field smoothing
+
+    # Formulaic EROSION (Smart Core) - how deep to erode based on complexity
+    # Smooth regions (complexity 0) → erode base_px (safety margin only)
+    # Complex regions like hair (complexity 1) → erode up to base + max px (deep root blending)
+    erosion_base_px: float = 1.0        # Minimum erosion (smooth regions like shoulders)
+    erosion_max_px: float = 14.0        # Additional erosion for complex regions (hair roots)
+
+    # Formulaic DILATION (Dynamic Reach) - how far to search based on complexity
+    # Smooth regions → base_px reach, Complex regions → base + max reach
+    adaptive_base_px: float = 2.0       # Minimum reach (smooth regions)
+    adaptive_max_px: float = 60.0       # Maximum additional reach (complex regions like hair)
 
     # === MOTION-AWARE MODE (Optical Flow Weighting) ===
     # Expand unknown zone based on motion blur
     motion_aware: bool = False          # Enable motion-weighted trimap
     motion_max_speed: float = 30.0      # Max pixel motion to consider (clips outliers)
     motion_blur_kernel: int = 15        # Gaussian blur for motion field
-    motion_weight: float = 20.0         # Motion multiplier for unknown zone expansion
+    motion_weight: float = 40.0         # Motion multiplier for unknown zone expansion (increased for better blur coverage)
 
 
 @dataclass
@@ -452,6 +461,7 @@ class TrimapSynthesizer:
         # =====================================================================
         # STEP 1: COMPUTE COMPLEXITY MAP (Depth Gradient Magnitude)
         # =====================================================================
+        # complexity: 0.0 (smooth like shoulders) to 1.0 (messy like hair)
         complexity_map = self._compute_complexity_map(depth)
 
         # =====================================================================
@@ -462,58 +472,87 @@ class TrimapSynthesizer:
             motion_factor = self._compute_motion_factor(prev_frame_gray, curr_frame_gray)
 
         # =====================================================================
-        # STEP 3: COMPUTE DISTANCE FROM CORE BODY
+        # STEP 3: DISTANCE TRANSFORMS (Both directions)
         # =====================================================================
-        # Invert mask: 0 is body, 255 is background
-        inv_mask = cv2.bitwise_not(mask_binary * 255)
-        # Distance transform: each pixel's distance from the body
-        dist_map = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
+        mask_255 = (mask_binary * 255).astype(np.uint8)
+
+        # dist_inside: Distance from edge to center (for EROSION)
+        dist_inside = cv2.distanceTransform(mask_255, cv2.DIST_L2, 5)
+
+        # dist_outside: Distance from edge to background (for DILATION)
+        inv_mask = cv2.bitwise_not(mask_255)
+        dist_outside = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
 
         # =====================================================================
-        # STEP 4: THE DYNAMIC FORMULA
+        # STEP 4: FORMULAIC EROSION (The "Smart Core")
         # =====================================================================
-        # dynamic_threshold = base + (max * complexity) + (weight * motion)
-        dynamic_threshold = (
+        # Erosion also adapts to local complexity:
+        # - Smooth regions (complexity 0) → Erode 1px (safety margin only)
+        # - Complex regions like hair (complexity 1) → Erode 15px (deep root blending)
+        erosion_threshold = (
+            self.config.erosion_base_px +
+            (self.config.erosion_max_px * complexity_map)
+        )
+
+        # Create the Dynamic Core
+        # A pixel is core ONLY if it is deep enough inside (beyond erosion threshold)
+        core_mask = (dist_inside > erosion_threshold).astype(np.uint8) * 255
+
+        self.logger.debug(
+            f"ADAPTIVE: Erosion threshold range: {erosion_threshold.min():.1f}px - {erosion_threshold.max():.1f}px"
+        )
+
+        # =====================================================================
+        # STEP 5: FORMULAIC DILATION (The "Dynamic Reach")
+        # =====================================================================
+        # External reach adapts to complexity and motion:
+        # - Smooth regions → base_px reach (e.g., 2px)
+        # - Complex regions → up to max_px reach (e.g., 60px)
+        # - Motion blur areas → additional expansion
+        dilation_threshold = (
             self.config.adaptive_base_px +
             (self.config.adaptive_max_px * complexity_map) +
             (self.config.motion_weight * motion_factor)
         )
 
         self.logger.debug(
-            f"ADAPTIVE: Dynamic threshold range: {dynamic_threshold.min():.1f}px - {dynamic_threshold.max():.1f}px"
+            f"ADAPTIVE: Dilation threshold range: {dilation_threshold.min():.1f}px - {dilation_threshold.max():.1f}px"
         )
 
         # =====================================================================
-        # STEP 5: CORE FOREGROUND (Erode for definite FG)
+        # STEP 6: THE "NO-GAP" ASSEMBLY
         # =====================================================================
-        erosion_size = self.config.core_erosion * 2 + 1
-        erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erosion_size, erosion_size))
-        core_fg = cv2.erode(mask_binary, erode_kernel, iterations=1)
+        # This guarantees the black line never exists.
+        # Everything within bounds that isn't white must be grey.
 
-        # =====================================================================
-        # STEP 6: BUILD TRIMAP
-        # =====================================================================
-        # Unknown zone = pixels where distance < dynamic_threshold AND distance > 0
-        unknown_zone = (dist_map < dynamic_threshold) & (dist_map > 0)
+        # Step A: Define the Outer Limit (Everything that ISN'T background)
+        # Valid if inside the mask OR within dynamic reach outside
+        is_potentially_foreground = (mask_binary > 0) | (dist_outside < dilation_threshold)
 
-        # Build final trimap
+        # Step B: Build Trimap
         trimap = np.zeros((h, w), dtype=np.uint8)
-        trimap[core_fg > 0] = 255           # Definite Foreground
-        trimap[unknown_zone] = 128          # Adaptive Unknown
+
+        # Fill the WHOLE potential area with Grey first
+        trimap[is_potentially_foreground] = 128
+
+        # Stamp the Smart Core on top (White)
+        trimap[core_mask == 255] = 255
 
         # Stats
         fg_pixels = np.sum(trimap == 255)
         unknown_pixels = np.sum(trimap == 128)
         bg_pixels = np.sum(trimap == 0)
 
-        # Compute average unknown width for logging
-        unknown_widths = dynamic_threshold[unknown_zone] if np.any(unknown_zone) else np.array([0])
-        avg_width = np.mean(unknown_widths) if len(unknown_widths) > 0 else 0
+        # Compute average widths for logging
+        outer_zone = (dist_outside > 0) & (dist_outside < dilation_threshold)
+        avg_dilation = np.mean(dilation_threshold[outer_zone]) if np.any(outer_zone) else 0
+        inner_zone = (dist_inside > 0) & (dist_inside <= erosion_threshold)
+        avg_erosion = np.mean(erosion_threshold[inner_zone]) if np.any(inner_zone) else 0
 
         self.logger.info(
             f"ADAPTIVE Trimap: FG={fg_pixels:,}, Unknown={unknown_pixels:,}, BG={bg_pixels:,}"
         )
-        self.logger.info(f"ADAPTIVE: Average unknown width: {avg_width:.1f}px")
+        self.logger.info(f"ADAPTIVE: Avg erosion={avg_erosion:.1f}px, Avg dilation={avg_dilation:.1f}px")
 
         return trimap
 
@@ -1122,11 +1161,12 @@ class GeometricMatteRefiner:
                 # Convert RGB to linear for better edge detection
                 rgb_linear = srgb_to_linear(rgb.astype(np.float32) / 255.0)
 
-                # SOURCEOFTRUTH: radius 2-4, eps 1e-6
+                # Guided Filter: radius=2 preserves single-pixel hair strands
+                # Lower radius = less aggressive smoothing, better fine detail
                 alpha_refined = ximgproc.guidedFilter(
                     guide=rgb_linear,
                     src=alpha.astype(np.float32),
-                    radius=4,
+                    radius=2,
                     eps=1e-6
                 )
                 alpha = np.clip(alpha_refined, 0, 1).astype(np.float32)
@@ -1290,8 +1330,8 @@ EXAMPLES:
     # Trimap settings
     parser.add_argument("--no-adaptive", action="store_true",
                        help="Disable adaptive mode, use legacy fixed-dilation trimap")
-    parser.add_argument("--core-erosion", type=int, default=10,
-                       help="Erosion for core foreground (default: 10px)")
+    parser.add_argument("--core-erosion", type=int, default=5,
+                       help="Erosion for core foreground (default: 5px, reduced from 10 to prevent gap)")
     parser.add_argument("--highpass-threshold", type=float, default=0.01,
                        help="Depth high-pass threshold (default: 0.01)")
     parser.add_argument("--hair-boost", type=int, default=15,
@@ -1326,20 +1366,28 @@ EXAMPLES:
                        help="Width of simple edge band (default: 30)")
 
     # Adaptive mode tuning (Formulaic Distance Approach - enabled by default)
-    parser.add_argument("--adaptive-base", type=float, default=2.0,
-                       help="Minimum unknown width for smooth regions (default: 2)")
-    parser.add_argument("--adaptive-max", type=float, default=60.0,
-                       help="Maximum unknown width for complex regions like hair (default: 60)")
     parser.add_argument("--adaptive-blur", type=int, default=21,
                        help="Blur kernel for complexity field smoothing (default: 21)")
+
+    # Formulaic EROSION (Smart Core)
+    parser.add_argument("--erosion-base", type=float, default=1.0,
+                       help="Minimum erosion for smooth regions like shoulders (default: 1)")
+    parser.add_argument("--erosion-max", type=float, default=14.0,
+                       help="Additional erosion for complex regions like hair roots (default: 14)")
+
+    # Formulaic DILATION (Dynamic Reach)
+    parser.add_argument("--adaptive-base", type=float, default=2.0,
+                       help="Minimum dilation reach for smooth regions (default: 2)")
+    parser.add_argument("--adaptive-max", type=float, default=60.0,
+                       help="Maximum additional reach for complex regions like hair (default: 60)")
 
     # Motion-aware mode (Optical Flow)
     parser.add_argument("--motion-aware", action="store_true",
                        help="Enable motion-weighted trimap using optical flow")
     parser.add_argument("--motion-max-speed", type=float, default=30.0,
                        help="Max pixel motion before clipping (default: 30)")
-    parser.add_argument("--motion-weight", type=float, default=20.0,
-                       help="Motion multiplier for unknown zone expansion (default: 20)")
+    parser.add_argument("--motion-weight", type=float, default=30.0,
+                       help="Motion multiplier for unknown zone expansion (default: 30)")
 
     # ViTMatte settings
     parser.add_argument("--model-size", choices=["small", "base"], default="base",
@@ -1370,7 +1418,7 @@ def main():
     # Build config - adaptive mode is now the default
     config = GeometricMatteConfig(
         trimap=TrimapConfig(
-            # Core parameters
+            # Core parameters (legacy, used in non-adaptive mode)
             core_erosion=args.core_erosion,
             highpass_threshold=args.highpass_threshold,
             # Depth confidence intervals
@@ -1391,9 +1439,13 @@ def main():
             use_linear_colorspace=True,
             # Adaptive mode (Formulaic Distance Approach) - DEFAULT
             adaptive_mode=not args.no_adaptive,
+            adaptive_blur_kernel=args.adaptive_blur,
+            # Formulaic EROSION (Smart Core)
+            erosion_base_px=args.erosion_base,
+            erosion_max_px=args.erosion_max,
+            # Formulaic DILATION (Dynamic Reach)
             adaptive_base_px=args.adaptive_base,
             adaptive_max_px=args.adaptive_max,
-            adaptive_blur_kernel=args.adaptive_blur,
             # Motion-aware mode (Optical Flow)
             motion_aware=args.motion_aware,
             motion_max_speed=args.motion_max_speed,
@@ -1445,7 +1497,8 @@ def main():
 
     # Log mode info
     if config.trimap.adaptive_mode:
-        logger.info(f"ADAPTIVE MODE: base={config.trimap.adaptive_base_px}px, max={config.trimap.adaptive_max_px}px")
+        logger.info(f"ADAPTIVE MODE: Erosion {config.trimap.erosion_base_px}-{config.trimap.erosion_base_px + config.trimap.erosion_max_px}px, "
+                   f"Dilation {config.trimap.adaptive_base_px}-{config.trimap.adaptive_base_px + config.trimap.adaptive_max_px}px")
         if config.trimap.motion_aware:
             logger.info(f"MOTION-AWARE: weight={config.trimap.motion_weight}, max_speed={config.trimap.motion_max_speed}")
 

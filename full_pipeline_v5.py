@@ -78,10 +78,16 @@ class PipelineConfig:
     # Stage control
     skip_sam: bool = False
     skip_depth: bool = False
+    skip_vitmatte: bool = False  # ViTMatte alpha refinement
     skip_edge: bool = False
     skip_temporal: bool = False
     skip_combine: bool = False
     skip_hair: bool = True  # Hair refinement optional, off by default
+
+    # ViTMatte settings (adaptive trimap)
+    vitmatte_motion_aware: bool = False
+    vitmatte_adaptive_base: float = 2.0
+    vitmatte_adaptive_max: float = 60.0
 
     # Model sizes (auto-set by quality preset)
     sam_model: str = ""
@@ -225,9 +231,10 @@ def run_pipeline(config: PipelineConfig):
     # Intermediate directories
     sam_output = output_dir / "01_sam_output"
     depth_output = output_dir / "02_depth_output"
-    edge_output = output_dir / "03_edge_output"
-    temporal_output = output_dir / "04_temporal_output"
-    combine_output = output_dir / "05_combine_output"
+    vitmatte_output = output_dir / "03_vitmatte_output"
+    edge_output = output_dir / "04_edge_output"
+    temporal_output = output_dir / "05_temporal_output"
+    combine_output = output_dir / "06_combine_output"
     final_output = output_dir / "final"
 
     # Find scripts
@@ -322,15 +329,63 @@ def run_pipeline(config: PipelineConfig):
         depth_output = sam_output
 
     # =========================================================================
-    # STAGE 3: Edge Refinement
+    # STAGE 3: ViTMatte Alpha Refinement (Adaptive Trimap)
+    # =========================================================================
+    if not config.skip_vitmatte:
+        vitmatte_script = find_script("vitmatte_refine.py")
+
+        # Determine sources
+        sam_alpha = sam_output / "alpha"
+        if not sam_alpha.exists():
+            sam_alpha = sam_output
+
+        depth_maps = depth_output / "depth"
+        if not depth_maps.exists():
+            depth_maps = depth_output
+
+        vitmatte_args = [
+            "--sam-mask", str(sam_alpha),
+            "--depth", str(depth_maps),
+            "--frames", config.input_path,
+            "--output", str(vitmatte_output),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+            "--core-erosion", "10",
+            "--adaptive-base", str(config.vitmatte_adaptive_base),
+            "--adaptive-max", str(config.vitmatte_adaptive_max),
+            "--save-trimap",
+        ]
+
+        if config.vitmatte_motion_aware:
+            vitmatte_args.append("--motion-aware")
+
+        if config.verbose:
+            vitmatte_args.append("--verbose")
+
+        success = run_python_stage(
+            vitmatte_script, vitmatte_args,
+            "ViTMatte Alpha Refinement", config.verbose
+        )
+
+        if not success:
+            logger.warning("ViTMatte refinement failed, continuing with depth output")
+            vitmatte_output = depth_output
+
+        clear_gpu_memory()
+    else:
+        logger.info("Skipping ViTMatte (--skip-vitmatte)")
+        vitmatte_output = depth_output
+
+    # =========================================================================
+    # STAGE 4: Edge Refinement
     # =========================================================================
     if not config.skip_edge:
         edge_script = find_script("edge_refine.py")
 
-        # Determine alpha source
-        alpha_source = depth_output / "alpha"
+        # Determine alpha source (now from ViTMatte)
+        alpha_source = vitmatte_output / "alpha"
         if not alpha_source.exists():
-            alpha_source = depth_output
+            alpha_source = vitmatte_output
 
         edge_args = [
             "--alpha", str(alpha_source),
@@ -353,13 +408,13 @@ def run_pipeline(config: PipelineConfig):
 
         if not success:
             logger.warning("Edge refinement failed, continuing with previous output")
-            edge_output = depth_output
+            edge_output = vitmatte_output
     else:
         logger.info("Skipping Edge Refinement (--skip-edge)")
-        edge_output = depth_output
+        edge_output = vitmatte_output
 
     # =========================================================================
-    # STAGE 4: Temporal Smoothing
+    # STAGE 5: Temporal Smoothing
     # =========================================================================
     if not config.skip_temporal:
         temporal_script = find_script("temporal_smooth.py")
@@ -395,7 +450,7 @@ def run_pipeline(config: PipelineConfig):
         temporal_output = edge_output
 
     # =========================================================================
-    # STAGE 5: Matte Combination
+    # STAGE 6: Matte Combination
     # =========================================================================
     if not config.skip_combine:
         combine_script = find_script("matte_combine.py")
@@ -431,7 +486,7 @@ def run_pipeline(config: PipelineConfig):
         combine_output = temporal_output
 
     # =========================================================================
-    # STAGE 6: Hair Refinement (Optional)
+    # STAGE 7: Hair Refinement (Optional)
     # =========================================================================
     if not config.skip_hair:
         hair_script = find_script("hair_refine.py")
@@ -441,7 +496,7 @@ def run_pipeline(config: PipelineConfig):
         if not alpha_source.exists():
             alpha_source = combine_output
 
-        hair_output = output_dir / "06_hair_output"
+        hair_output = output_dir / "07_hair_output"
 
         hair_args = [
             "--alpha", str(alpha_source),
@@ -491,7 +546,7 @@ def run_pipeline(config: PipelineConfig):
     # Cleanup intermediate if not keeping
     if not config.keep_intermediate:
         logger.info("Cleaning up intermediate files...")
-        for intermediate in [sam_output, depth_output, edge_output,
+        for intermediate in [sam_output, depth_output, vitmatte_output, edge_output,
                            temporal_output, combine_output]:
             if intermediate.exists() and intermediate != final_output:
                 shutil.rmtree(intermediate, ignore_errors=True)
@@ -573,6 +628,8 @@ QUALITY PRESETS:
                        help="Skip SAM2 (use existing alpha)")
     parser.add_argument("--skip-depth", action="store_true",
                        help="Skip depth refinement")
+    parser.add_argument("--skip-vitmatte", action="store_true",
+                       help="Skip ViTMatte alpha refinement")
     parser.add_argument("--skip-edge", action="store_true",
                        help="Skip edge refinement")
     parser.add_argument("--skip-temporal", action="store_true",
@@ -589,6 +646,14 @@ QUALITY PRESETS:
     parser.add_argument("--depth-model",
                        choices=["small", "base", "large"],
                        help="Override Depth model size")
+
+    # ViTMatte settings (adaptive trimap)
+    parser.add_argument("--vitmatte-motion", action="store_true",
+                       help="Enable motion-aware trimap for ViTMatte")
+    parser.add_argument("--vitmatte-base", type=float, default=2.0,
+                       help="Min unknown width for smooth regions (default: 2)")
+    parser.add_argument("--vitmatte-max", type=float, default=60.0,
+                       help="Max unknown width for complex regions (default: 60)")
 
     # Edge settings
     parser.add_argument("--edge-softness", type=float, default=1.0,
@@ -632,12 +697,16 @@ def main():
         quality=args.quality,
         skip_sam=args.skip_sam,
         skip_depth=args.skip_depth,
+        skip_vitmatte=args.skip_vitmatte,
         skip_edge=args.skip_edge,
         skip_temporal=args.skip_temporal,
         skip_combine=args.skip_combine,
         skip_hair=not args.with_hair,
         sam_model=args.sam_model or "",
         depth_model=args.depth_model or "",
+        vitmatte_motion_aware=args.vitmatte_motion,
+        vitmatte_adaptive_base=args.vitmatte_base,
+        vitmatte_adaptive_max=args.vitmatte_max,
         edge_softness=args.edge_softness,
         core_shrink=args.core_shrink,
         despill_strength=args.despill,

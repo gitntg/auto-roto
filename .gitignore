@@ -83,6 +83,7 @@ weights/
 *_depth_refined*/
 test_output*/
 test_input/
+test_vitmatte_*/
 
 # Comparison/debug images
 comparison_*.jpg
@@ -109,3 +110,4 @@ segment-anything-2/
 
 # Logs
 *.log
+
