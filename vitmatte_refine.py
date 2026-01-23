@@ -43,24 +43,21 @@ import numpy as np
 class TrimapConfig:
     """Configuration for trimap synthesis.
 
-    SOURCEOFTRUTH Hard Numbers:
-    - Trimap Width: 25-40px minimum unknown region for ViTMatte attention
+    DEFAULT: Adaptive Mode (Formulaic Distance Approach)
+    - Unknown width varies based on local depth complexity
+    - Smooth regions: ~2px, Complex regions (hair): up to 60px
+    - Optional motion-aware expansion using optical flow
+
+    Core Parameters:
     - Core Erosion: 10px for definite foreground
-    - Depth Logic: High-pass (Laplacian), NOT absolute thresholds
-    - Depth Confidence: 0.4-0.6 range is "Unknown", not classified
+    - Depth Logic: High-pass (Laplacian) for geometric strands
     """
 
-    # === SCIENTIFIC MODE (SOURCEOFTRUTH Golden Rule) ===
-    scientific_mode: bool = True    # Use SOURCEOFTRUTH approach (recommended)
-
     # Core foreground (eroded SAM2 mask)
-    # SOURCEOFTRUTH: "Erode SAM2 by 10px for definite foreground"
     core_erosion: int = 10          # Pixels to erode for definite foreground
 
-    # Wide search area (dilated SAM2 mask)
-    # SOURCEOFTRUTH: "Dilate SAM2 by 25px for wide context window"
-    # "Unknown region must be 25-40px wide for ViTMatte transformer attention"
-    unknown_dilation: int = 25      # Pixels to dilate for search area boundary
+    # Legacy mode: fixed dilation (used when adaptive_mode=False)
+    unknown_dilation: int = 25      # Fixed dilation for legacy fallback
 
     # Depth high-pass for geometric strands
     highpass_threshold: float = 0.01  # Depth gradient threshold for "spikes"
@@ -94,7 +91,7 @@ class TrimapConfig:
 
     # === ADAPTIVE MODE (Formulaic Distance Approach) ===
     # Instead of hard-coded dilation, use depth gradient magnitude for local variance
-    adaptive_mode: bool = False         # Enable adaptive trimap (overrides scientific_mode)
+    adaptive_mode: bool = True          # Adaptive trimap is now the default
     adaptive_base_px: float = 2.0       # Minimum reach (smooth regions like shoulders)
     adaptive_max_px: float = 60.0       # Maximum reach (complex regions like hair)
     adaptive_blur_kernel: int = 21      # Gaussian blur for complexity field smoothing
@@ -722,20 +719,14 @@ class TrimapSynthesizer:
             return self._simple_edge_trimap(mask_binary)
 
         # =====================================================================
-        # ADAPTIVE MODE: Formulaic Distance + Motion-Aware Trimap
+        # ADAPTIVE MODE: Formulaic Distance + Motion-Aware Trimap (DEFAULT)
         # Uses local depth complexity for variable unknown width
         # =====================================================================
         if self.config.adaptive_mode:
             return self._adaptive_trimap(mask_binary, depth, prev_frame_gray, curr_frame_gray)
 
         # =====================================================================
-        # SCIENTIFIC MODE: SOURCEOFTRUTH Golden Rule Implementation
-        # =====================================================================
-        if self.config.scientific_mode:
-            return self._scientific_trimap(mask_binary, depth)
-
-        # =====================================================================
-        # LEGACY MODE: Complex depth analysis (kept for backwards compatibility)
+        # LEGACY MODE: Complex depth analysis (fallback if adaptive disabled)
         # =====================================================================
         # STEP 1: DEFINITE FOREGROUND (Core)
         # Erode SAM2 mask to get pixels we're 100% sure are foreground
@@ -1296,15 +1287,11 @@ EXAMPLES:
     parser.add_argument("--output", "-o", default="./vitmatte_output",
                        help="Output directory")
 
-    # Trimap settings (SOURCEOFTRUTH defaults)
-    parser.add_argument("--scientific-mode", action="store_true", default=True,
-                       help="Use SOURCEOFTRUTH scientific trimap (default: True)")
-    parser.add_argument("--legacy-mode", action="store_true",
-                       help="Use legacy complex trimap mode instead of scientific")
+    # Trimap settings
+    parser.add_argument("--no-adaptive", action="store_true",
+                       help="Disable adaptive mode, use legacy fixed-dilation trimap")
     parser.add_argument("--core-erosion", type=int, default=10,
-                       help="Erosion for core foreground (SOURCEOFTRUTH: 10px)")
-    parser.add_argument("--unknown-radius", type=int, default=25,
-                       help="Dilation for wide search area (SOURCEOFTRUTH: 25px)")
+                       help="Erosion for core foreground (default: 10px)")
     parser.add_argument("--highpass-threshold", type=float, default=0.01,
                        help="Depth high-pass threshold (default: 0.01)")
     parser.add_argument("--hair-boost", type=int, default=15,
@@ -1338,9 +1325,7 @@ EXAMPLES:
     parser.add_argument("--simple-width", type=int, default=30,
                        help="Width of simple edge band (default: 30)")
 
-    # Adaptive mode (Formulaic Distance Approach)
-    parser.add_argument("--adaptive-mode", action="store_true",
-                       help="Use adaptive trimap with local depth-based variance (replaces fixed dilation)")
+    # Adaptive mode tuning (Formulaic Distance Approach - enabled by default)
     parser.add_argument("--adaptive-base", type=float, default=2.0,
                        help="Minimum unknown width for smooth regions (default: 2)")
     parser.add_argument("--adaptive-max", type=float, default=60.0,
@@ -1382,20 +1367,13 @@ EXAMPLES:
 def main():
     args = parse_args()
 
-    # Determine trimap mode
-    # Legacy mode overrides scientific mode
-    scientific_mode = not args.legacy_mode
-
-    # Build config with SOURCEOFTRUTH defaults
+    # Build config - adaptive mode is now the default
     config = GeometricMatteConfig(
         trimap=TrimapConfig(
-            # Mode selection
-            scientific_mode=scientific_mode,
-            # Core parameters (SOURCEOFTRUTH: erode 10px, dilate 25px)
+            # Core parameters
             core_erosion=args.core_erosion,
-            unknown_dilation=args.unknown_radius,
             highpass_threshold=args.highpass_threshold,
-            # Depth confidence intervals (SOURCEOFTRUTH: 0.8/0.2, unknown 0.4-0.6)
+            # Depth confidence intervals
             depth_core_threshold=args.depth_core,
             depth_bg_threshold=args.depth_bg,
             depth_unknown_low=args.depth_unknown_low,
@@ -1403,16 +1381,16 @@ def main():
             # Hair and connectivity
             hair_dilation_boost=args.hair_boost,
             require_connectivity=args.connectivity,
-            # Soft trimap (SOURCEOFTRUTH recommends hard)
+            # Soft trimap options
             soft_unknown=args.soft_trimap and not args.hard_trimap,
             unknown_softness=args.unknown_softness,
             # Simple mode
             simple_edge_mode=args.simple_mode,
             simple_edge_width=args.simple_width,
-            # Linear color space (SOURCEOFTRUTH requirement)
+            # Linear color space
             use_linear_colorspace=True,
-            # Adaptive mode (Formulaic Distance Approach)
-            adaptive_mode=args.adaptive_mode,
+            # Adaptive mode (Formulaic Distance Approach) - DEFAULT
+            adaptive_mode=not args.no_adaptive,
             adaptive_base_px=args.adaptive_base,
             adaptive_max_px=args.adaptive_max,
             adaptive_blur_kernel=args.adaptive_blur,

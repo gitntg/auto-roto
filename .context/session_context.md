@@ -68,37 +68,44 @@ wide_search = dilate(sam_mask, 25px)    # Context window
 4. ✅ Added Guided Filter post-processing
 5. ✅ Cleaned up repo (removed 830MB test outputs, 12 debug scripts)
 
-## New: Adaptive Trimap Mode (v5.2)
+## Adaptive Trimap Mode (v5.2) - NOW DEFAULT
 
-Integrated **Formulaic Distance Approach** + **Motion-Aware Trimap**:
+**Adaptive mode is now the default.** Replaces fixed dilation with depth gradient-based local variance.
 
-| Feature | Description |
-|---------|-------------|
-| `--adaptive-mode` | Replace fixed dilation with depth gradient-based variance |
-| `--motion-aware` | Expand unknown zone based on optical flow |
-
-### Adaptive Mode Formula
+### The Formula
 ```
 dynamic_threshold = base_px + (max_px * complexity_map) + (weight * motion_factor)
 ```
 
-- Smooth regions (shoulders): ~2px unknown
-- Complex regions (hair): up to 60px unknown
-- Motion areas: additional expansion for blur
+| Region | Unknown Width |
+|--------|---------------|
+| Smooth (shoulders, walls) | ~2px |
+| Complex (hair, fine detail) | up to 60px |
+| Motion blur areas | +20px per motion unit |
 
 ### CLI Examples
 ```bash
-# Adaptive mode only
-python vitmatte_refine.py ... --adaptive-mode
+# Default (adaptive mode enabled)
+python vitmatte_refine.py --sam-mask ... --depth ... --frames ...
 
-# Adaptive + Motion-aware
-python vitmatte_refine.py ... --adaptive-mode --motion-aware
+# With motion-aware expansion
+python vitmatte_refine.py ... --motion-aware
 
-# Custom parameters
-python vitmatte_refine.py ... --adaptive-mode \
+# Custom tuning
+python vitmatte_refine.py ... \
   --adaptive-base 3 --adaptive-max 50 \
   --motion-aware --motion-weight 25
+
+# Disable adaptive (use legacy fixed dilation)
+python vitmatte_refine.py ... --no-adaptive
 ```
+
+### Key Methods Added
+| Method | Purpose |
+|--------|---------|
+| `_compute_complexity_map()` | Sobel gradient magnitude from depth |
+| `_compute_motion_factor()` | Farneback optical flow |
+| `_adaptive_trimap()` | Dynamic threshold trimap generation |
 
 ## Pending Work
 
