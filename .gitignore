@@ -104,10 +104,24 @@ nul
 
 # Cloned dependency repos (install separately)
 Depth-Anything-V2/
+depth-anything-3/
 GroundingDINO/
 sam2_repo/
 segment-anything-2/
 
 # Logs
 *.log
+
+# Images and video (don't commit media files)
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.exr
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
 
