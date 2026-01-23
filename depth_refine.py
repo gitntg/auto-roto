@@ -135,7 +135,7 @@ class DepthEstimator:
     MAX_PROCESS_RES_BY_MODEL = {
         "small": 768,
         "base": 1024,
-        "large": 1024,
+        "large": 2048,  # Uncapped for fine detail (was 1024)
         "nested-large": 2048,   # Nested architecture handles higher res natively
         "nested-base": 1536,
     }

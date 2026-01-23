@@ -105,6 +105,9 @@ class TrimapConfig:
     adaptive_base_px: float = 2.0       # Minimum reach (smooth regions)
     adaptive_max_px: float = 60.0       # Maximum additional reach (complex regions like hair)
 
+    # RGB Guidance (New)
+    rgb_complexity_weight: float = 1.0  # Influence of RGB texture on complexity (0-1)
+
     # === MOTION-AWARE MODE (Optical Flow Weighting) ===
     # Expand unknown zone based on motion blur
     motion_aware: bool = False          # Enable motion-weighted trimap
@@ -438,6 +441,7 @@ class TrimapSynthesizer:
         self,
         mask_binary: np.ndarray,
         depth: np.ndarray,
+        rgb: Optional[np.ndarray] = None,
         prev_frame_gray: Optional[np.ndarray] = None,
         curr_frame_gray: Optional[np.ndarray] = None
     ) -> np.ndarray:
@@ -459,10 +463,23 @@ class TrimapSynthesizer:
         h, w = mask_binary.shape
 
         # =====================================================================
-        # STEP 1: COMPUTE COMPLEXITY MAP (Depth Gradient Magnitude)
+        # STEP 1: COMPUTE COMPLEXITY MAP (Depth + RGB Gradient Magnitude)
         # =====================================================================
         # complexity: 0.0 (smooth like shoulders) to 1.0 (messy like hair)
-        complexity_map = self._compute_complexity_map(depth)
+        depth_complexity = self._compute_complexity_map(depth)
+        
+        # Add RGB guidance if available
+        if rgb is not None and self.config.rgb_complexity_weight > 0:
+            rgb_complexity = self._compute_rgb_complexity(rgb)
+            # Resize if needed (handling potential mismatches)
+            if rgb_complexity.shape != depth_complexity.shape:
+                rgb_complexity = cv2.resize(rgb_complexity, (w, h))
+            
+            # Combine: MAX(depth, rgb) ensures we capture edges from either source
+            # We scale RGB contribution by weight
+            complexity_map = np.maximum(depth_complexity, rgb_complexity * self.config.rgb_complexity_weight)
+        else:
+            complexity_map = depth_complexity
 
         # =====================================================================
         # STEP 2: COMPUTE MOTION FACTOR (Optional)
