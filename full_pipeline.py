@@ -1,9 +1,22 @@
 #!/usr/bin/env python
 """
-AUTO-ROTO FULL PIPELINE
-=======================
+AUTO-ROTO FULL PIPELINE (DEPRECATED)
+====================================
 
-Complete workflow that chains:
+!!! DEPRECATED: Use full_pipeline_v5.py instead !!!
+
+This legacy 2-stage pipeline is superseded by the v5 pipeline which includes:
+    - ViTMatte alpha matting for hair/fine details
+    - Edge refinement with subpixel precision
+    - Temporal smoothing for flicker-free output
+    - Multi-layer matte combination
+
+RECOMMENDED:
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
+
+---
+
+Legacy 2-stage workflow that chains:
     1. SAM2 segmentation (auto_roto.py)
     2. Depth Anything V2 refinement (depth_refine.py)
 
@@ -93,8 +106,21 @@ def run_stage(cmd: list, stage_name: str) -> bool:
 
 
 def main():
+    # Deprecation warning
+    import warnings
+    warnings.warn(
+        "\n\n"
+        "╔════════════════════════════════════════════════════════════════╗\n"
+        "║  DEPRECATED: full_pipeline.py is superseded by v5 pipeline    ║\n"
+        "║  Use: python full_pipeline_v5.py instead for better results   ║\n"
+        "╚════════════════════════════════════════════════════════════════╝\n",
+        DeprecationWarning,
+        stacklevel=2
+    )
+    logger.warning("DEPRECATED: Consider using full_pipeline_v5.py for better results")
+
     parser = argparse.ArgumentParser(
-        description="AUTO-ROTO Full Pipeline (SAM2 + Depth Refinement)",
+        description="AUTO-ROTO Full Pipeline (SAM2 + Depth Refinement) [DEPRECATED - use full_pipeline_v5.py]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:

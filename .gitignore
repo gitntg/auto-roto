@@ -84,6 +84,9 @@ weights/
 test_output*/
 test_input/
 test_vitmatte_*/
+test_nested_*/
+test_depth_*/
+refined_test/
 
 # Comparison/debug images
 comparison_*.jpg
@@ -98,6 +101,8 @@ zoom_*.jpg
 .claude-context.json
 .claude/
 $CLAUDE_ENV_FILE
+.context/
+.serena/
 
 # Temp/null files
 nul

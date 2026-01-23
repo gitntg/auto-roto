@@ -4,54 +4,31 @@
 [![PyTorch 2.5+](https://img.shields.io/badge/pytorch-2.5+-orange.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-**Bulletproof automatic rotoscoping that generates perfect alpha mattes from complex video clips.**
+**Automatic rotoscoping that generates production-quality alpha mattes from video clips.**
 
-Built on SAM2 (Segment Anything Model 2.1) with optional GroundingDINO for text-based object detection, plus production-quality alpha refinement for hair, fine details, and motion blur.
-
----
-
-## 🎯 Why This Exists
-
-ComfyUI and other auto-roto solutions often fail because:
-- They use outdated models with poor temporal consistency
-- Output binary masks instead of proper alpha mattes
-- No edge refinement for hair/fine details
-- Frame-by-frame processing causes flickering
-
-**AUTO-ROTO solves these problems** by combining:
-- **SAM 2.1** with temporal memory for rock-solid consistency across frames
-- **GroundingDINO** for automatic object detection via text prompts
-- **Alpha matting refinement** for proper semi-transparent edges
-- **Production-grade output** (16-bit EXR sequences for Nuke/After Effects)
+Built on SAM2 (Segment Anything Model 2.1) with ViTMatte for fine detail matting, Depth Anything V3 for edge refinement, and professional VFX quality enhancements.
 
 ---
 
-## 📋 Features
+## Features
 
-### Core Features
-- ✅ **Text-based detection** - "person", "car", "dog" → instant roto
-- ✅ **Temporal consistency** - SAM2's memory prevents flickering
-- ✅ **Multi-object support** - Track multiple objects simultaneously
-- ✅ **Alpha refinement** - Proper hair/edge handling, not binary masks
-- ✅ **Interactive mode** - Click to select objects on first frame
+- **Text-based detection** - "person", "car", "dog" -> instant roto via GroundingDINO
+- **ViTMatte integration** - True alpha matting for hair and fine details
+- **Depth-guided refinement** - Depth Anything V2/V3 for edge quality
+- **Temporal consistency** - Optical flow-based anti-flicker
+- **Multi-object support** - Track multiple objects simultaneously
+- **Production output** - 16-bit EXR sequences for Nuke/After Effects
 
-### Input/Output
-- ✅ Video files (MP4, MOV, MKV, AVI, WebM, MXF)
-- ✅ Image sequences (EXR, PNG, TIFF, DPX, JPEG)
-- ✅ 16-bit EXR output for Nuke/Flame
-- ✅ PNG/TIFF with proper alpha channel
-- ✅ Preview JPGs for quick review
+### Supported Formats
 
-### Performance
-- ✅ GPU acceleration (CUDA)
-- ✅ Model compilation via `torch.compile` for 2-3x speedup
-- ✅ Batch processing for sequences
+**Input:** MP4, MOV, MKV, AVI, WebM, MXF, EXR, PNG, TIFF, DPX, JPEG sequences
+**Output:** EXR (16/32-bit), PNG, TIFF with proper alpha channel
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
-### 1. Installation
+### Installation
 
 ```bash
 # Clone this repo
@@ -70,35 +47,25 @@ Or manual install:
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Install SAM2
-git clone https://github.com/facebookresearch/sam2.git
-cd sam2 && pip install -e . && cd ..
+git clone https://github.com/facebookresearch/sam2.git sam2_repo
+cd sam2_repo && pip install -e . && cd ..
 
 # Install GroundingDINO (optional, for text prompts)
 git clone https://github.com/IDEA-Research/GroundingDINO.git
 cd GroundingDINO && pip install -e . && cd ..
 
-# Install Depth Anything V2 support (optional, for depth refinement)
-pip install transformers
-git clone https://github.com/DepthAnything/Depth-Anything-V2.git
-
-# Install other dependencies
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Basic Usage
+### Basic Usage
 
 ```bash
-# RECOMMENDED: V5 Pipeline (Best Quality)
+# Recommended: Full V5 Pipeline
 python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
 
-# V5 with quality preset
-python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
-
-# V5 for PNG sequence
-python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output
-
-# Original pipeline (SAM2 + Depth only)
-python full_pipeline.py --input video.mp4 --prompt "person" --output ./output
+# With quality preset
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --quality high
 
 # SAM2 only (fastest)
 python auto_roto.py --input video.mp4 --prompt "person" --output ./output
@@ -106,35 +73,18 @@ python auto_roto.py --input video.mp4 --prompt "person" --output ./output
 # Multiple objects
 python auto_roto.py --input video.mp4 --prompt "person.dog.car" --output ./output
 
-# Interactive selection (click to draw boxes)
+# Interactive mode (click to select)
 python auto_roto.py --input video.mp4 --interactive --output ./output
-```
-
-### 3. Two-Pass Workflow (Sequential GPU Usage)
-
-Since SAM2 and Depth Anything V2 can't fit in VRAM simultaneously:
-
-```bash
-# Pass 1: SAM2 segmentation (releases GPU when done)
-python auto_roto.py --input video.mp4 --prompt "person" --output ./sam_out --no-refine
-
-# Pass 2: Depth-guided refinement
-python depth_refine.py --alpha ./sam_out/alpha/ --video video.mp4 --output ./final
-```
-
-Or use the automated full pipeline:
-```bash
-python full_pipeline.py --input video.mp4 --prompt "person" --output ./output
 ```
 
 ---
 
-## 🎬 V5 Pipeline (NEW - Best Quality)
+## V5 Pipeline
 
-The v5 pipeline adds professional VFX quality enhancements:
+The recommended pipeline chains multiple refinement stages:
 
 ```
-SAM2 → Depth → Edge Refine → Temporal Smooth → Matte Combine → Final
+SAM2 -> Depth -> ViTMatte -> Edge Refine -> Temporal Smooth -> Final
 ```
 
 ### Quality Presets
@@ -146,311 +96,165 @@ SAM2 → Depth → Edge Refine → Temporal Smooth → Matte Combine → Final
 | high | large | large | 7 frames | Hero shots |
 | ultra | large | large | 9 frames | Maximum quality |
 
-### V5 Specific Options
-
-```bash
-# High quality with all enhancements
-python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
-
-# Skip temporal smoothing (faster)
-python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --skip-temporal
-
-# Custom edge settings
-python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output \
-    --edge-softness 1.5 --core-shrink 5 --despill 0.7
-
-# Keep intermediate files for debugging
-python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --keep-intermediate
-```
-
-### V5 New Features
-
-- **Subpixel Edge Detection**: Laplacian-of-Gaussian for precise edge localization
-- **Color Difference Keying**: Primatte/Keylight-style edge color sampling
-- **Temporal Coherence**: Optical flow-based anti-flicker
-- **Multi-Layer Mattes**: Core + Detail + Soft Edge architecture
-- **Professional Despill**: Complementary color suppression
-- **Premultiplied Alpha**: Proper compositing math
-
----
-
-## 🌊 Depth-Guided Refinement
-
-Depth Anything V2 provides a second refinement pass that significantly improves edge quality:
-
-### How It Works
-
-```
-SAM2 Mask → Depth Map → Compare Edges → Refine Alpha
-                ↓
-    Depth discontinuity = object edge
-    Continuous depth = preserve softness
-```
-
-**Key benefits:**
-- **Hair/fine detail**: Depth helps identify where soft edges should be
-- **Overlapping objects**: Depth ordering separates layers
-- **Motion blur**: Continuous depth regions preserve natural blur
-- **Hard edges**: Sharp depth changes get sharpened
-
 ### Usage
 
 ```bash
-# On existing alpha mattes
-python depth_refine.py --alpha ./output/alpha/ --video input.mp4 --output ./refined
+# Standard quality (default)
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
 
-# With pre-computed depth maps
-python depth_refine.py --alpha ./output/alpha/ --depth ./depth_maps/ --output ./refined
+# High quality
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --quality high
 
-# Adjust refinement strength
-python depth_refine.py --alpha ./output/alpha/ --video input.mp4 \
-    --edge-threshold 0.15 --blend-strength 0.7 --output ./refined
+# Skip temporal smoothing (faster)
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --skip-temporal
+
+# Keep intermediate files for debugging
+python full_pipeline_v5.py --input video.mp4 --prompt "person" --keep-intermediate
 ```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--edge-threshold` | 0.1 | Depth gradient threshold for hard edges |
-| `--blend-strength` | 0.5 | How strongly to apply refinement |
-| `--no-sharpen` | off | Disable edge sharpening |
-| `--no-soften` | off | Disable soft edge preservation |
-| `--depth-model` | large | Model size: small, base, large |
 
 ---
 
-### Command Line Options
+## Architecture
 
 ```
-Input/Output:
-  --input, -i      Input video file or image sequence directory
-  --output, -o     Output directory (default: ./output)
-
-Prompt Types (choose one):
-  --prompt, -p     Text prompt for detection (use . to separate multiple)
-  --box, -b        Box coordinates: x1,y1,x2,y2
-  --point          Point coordinates: x,y
-  --interactive    Draw boxes interactively on first frame
-
-SAM2 Settings:
-  --sam-model      Model size: tiny, small, base_plus, large (default: large)
-  --no-backward    Disable backward propagation
-
-Detection Settings:
-  --detection-threshold  GroundingDINO detection confidence (default: 0.3)
-  --text-threshold       GroundingDINO text similarity threshold (default: 0.25)
-
-Alpha Refinement:
-  --no-refine           Disable alpha refinement (output binary masks)
-  --refine-iterations   Refinement iterations (default: 3)
-  --edge-softness       Edge softness 0-5 (default: 1.0)
-
-Output Settings:
-  --format         Output format: exr, png, tiff (default: exr)
-  --bit-depth      Bit depth: 8, 16, 32 (default: 16)
-  --no-rgb         Don't output RGBA files
-  --no-preview     Don't generate preview images
-
-Performance:
-  --device         Device: cuda or cpu (default: cuda)
-  --no-compile     Disable torch.compile optimization
+                           V5 PIPELINE (full_pipeline_v5.py)
+                                      |
+    +------------------------------------------------------------------+
+    |                                                                  |
+    v                                                                  v
++-------------------+        +-------------------+        +-------------------+
+|   STAGE 1: SAM2   |  --->  |  STAGE 2: DEPTH   |  --->  | STAGE 3: VITMATTE |
+|  (auto_roto.py)   |        | (depth_refine.py) |        |(vitmatte_refine.py|
+|                   |        |                   |        |                   |
+| - Text/box prompt |        | - Depth Anything  |        | - Adaptive trimap |
+| - SAM2 temporal   |        |   V2 or V3        |        | - True alpha solve|
+| - Multi-object    |        | - Edge sharpening |        | - Hair/fine detail|
++-------------------+        +-------------------+        +-------------------+
+                                      |
+                                      v
++-------------------+        +-------------------+        +-------------------+
+| STAGE 4: EDGE     |  --->  | STAGE 5: TEMPORAL |  --->  | STAGE 6: COMBINE  |
+| (edge_refine.py)  |        |(temporal_smooth.py|        |(matte_combine.py) |
+|                   |        |                   |        |                   |
+| - Subpixel edges  |        | - Optical flow    |        | - Core/detail/soft|
+| - Color keying    |        | - Anti-flicker    |        | - Despill         |
+| - Despill         |        | - Keyframe anchor |        | - Final composite |
++-------------------+        +-------------------+        +-------------------+
 ```
 
-### Output Structure
+### Core Modules
+
+| Module | Purpose |
+|--------|---------|
+| `auto_roto.py` | SAM2 video segmentation with GroundingDINO |
+| `depth_refine.py` | Depth Anything V2/V3 edge refinement |
+| `vitmatte_refine.py` | ViTMatte alpha matting with adaptive trimap |
+| `edge_refine.py` | Professional subpixel edge processing |
+| `temporal_smooth.py` | Optical flow-based temporal coherence |
+| `matte_combine.py` | Multi-layer matte combination |
+| `full_pipeline_v5.py` | V5 orchestrator (recommended entry point) |
+
+---
+
+## Module Reference
+
+### SAM2 Segmentation (`auto_roto.py`)
+
+Core segmentation using SAM2's temporal memory for consistent tracking.
+
+```bash
+python auto_roto.py --input video.mp4 --prompt "person" --output ./output
+python auto_roto.py --input video.mp4 --box "100,100,500,400" --output ./output
+python auto_roto.py --input video.mp4 --interactive --output ./output
+```
+
+**Key options:**
+- `--sam-model`: tiny, small, base_plus, large (default: large)
+- `--no-refine`: Output binary masks (faster)
+- `--no-backward`: Disable backward propagation
+
+### Depth Refinement (`depth_refine.py`)
+
+Depth-guided edge refinement using Depth Anything V2 or V3.
+
+```bash
+python depth_refine.py --alpha ./output/alpha/ --video video.mp4 --output ./refined
+```
+
+**Key options:**
+- `--depth-model`: small, base, large
+- `--depth-version`: v2, v3 (default: v3)
+- `--edge-threshold`: Depth gradient threshold (default: 0.1)
+
+### ViTMatte Refinement (`vitmatte_refine.py`)
+
+True alpha matting using Vision Transformer with depth-aware trimap synthesis.
+
+```bash
+python vitmatte_refine.py --alpha ./output/alpha/ --video video.mp4 --output ./vitmatte
+```
+
+**Key options:**
+- `--adaptive`: Enable adaptive trimap width (default)
+- `--motion-aware`: Expand trimap in motion areas
+
+### Batch Processing (`batch_roto.py`)
+
+Process multiple videos with a config file.
+
+```bash
+python batch_roto.py --input ./videos/ --prompt "person" --output ./output/
+python batch_roto.py --config batch_config.json
+```
+
+---
+
+## Output Structure
 
 ```
 output/
-├── alpha/           # Alpha-only channels
+├── alpha/           # Alpha-only channels (primary output)
 │   ├── roto.0001.exr
 │   ├── roto.0002.exr
 │   └── ...
 ├── rgba/            # Full RGBA images
-│   ├── roto.0001.exr
-│   ├── roto.0002.exr
-│   └── ...
-└── preview/         # Quick preview images
-    ├── roto.0001.jpg
-    ├── roto.0002.jpg
-    └── ...
+├── preview/         # Quick preview JPGs
+└── depth/           # Depth maps (if saved)
 ```
 
 ---
 
-## 🔧 Nuke Integration
+## Nuke Integration
 
-### Reading EXR Sequences
+### Setup
 
-```python
-# In Nuke, use Read node:
-# File: /path/to/output/rgba/roto.####.exr
-# Frame Range: 1-100 (adjust to your range)
-```
+1. Copy `auto_roto_nuke.py` to `~/.nuke/`
+2. Add to `menu.py`:
+   ```python
+   import auto_roto_nuke
+   auto_roto_nuke.add_to_menu()
+   ```
 
-### Gizmo for Quick Import
+### Usage
 
-```tcl
-# autoroto_import.gizmo
-Group {
- name AutoRotoImport
- tile_color 0x7f00ffff
- 
- inputs 0
- 
- knobs {
-  filepath {/path/to/output/rgba/roto.####.exr}
- }
- 
- Read {
-  file "\[value filepath]"
-  format "1920 1080 0 0 1920 1080 1 HD"
-  name Read1
- }
- 
- Premult {
-  name Premult1
- }
- 
- Output {
-  name Output1
- }
-}
-```
+- Select Read node with video/sequence
+- Run: `Nodes > AUTO-ROTO > Process Selected`
 
 ---
 
-## 🎨 Tips for Best Results
+## Troubleshooting
 
-### Text Prompts
-- Be specific: "person in red shirt" > "person"
-- Use multiple prompts: "person.background.shadow"
-- Common objects work best: person, car, dog, cat, etc.
-
-### For Hair/Fine Details
-```bash
-# Increase refinement iterations and softness
-python auto_roto.py --input video.mp4 --prompt "person" \
-    --refine-iterations 5 --edge-softness 1.5 --output ./output
-```
-
-### For Fast Objects
-```bash
-# Use backward propagation to handle motion blur
-python auto_roto.py --input video.mp4 --prompt "car" --output ./output
-# (backward propagation is enabled by default)
-```
-
-### For Complex Scenes
-```bash
-# Use larger model for better accuracy
-python auto_roto.py --input video.mp4 --prompt "person" \
-    --sam-model large --output ./output
-```
-
-### For Speed (Lower Quality)
-```bash
-# Use tiny model
-python auto_roto.py --input video.mp4 --prompt "person" \
-    --sam-model tiny --no-refine --format png --output ./output
-```
+| Issue | Solution |
+|-------|----------|
+| CUDA out of memory | Use `--sam-model small` or `--quality draft` |
+| GroundingDINO not found | Use `--box` or `--interactive` instead of `--prompt` |
+| OpenEXR not available | Install: `pip install OpenEXR` (requires system libs) |
+| Flickering | Use `--quality high` or ensure temporal smoothing enabled |
+| Poor hair edges | Ensure ViTMatte stage is not skipped |
 
 ---
 
-## 🏗️ Architecture
-
-```
-                        FULL PIPELINE (full_pipeline.py)
-                                    │
-        ┌───────────────────────────┴───────────────────────────┐
-        │                                                       │
-        ▼                                                       ▼
-┌───────────────────┐                               ┌───────────────────┐
-│   STAGE 1: SAM2   │                               │  STAGE 2: DEPTH   │
-│   (auto_roto.py)  │ ────── GPU memory clear ───── │ (depth_refine.py) │
-└───────────────────┘                               └───────────────────┘
-        │                                                       │
-        ▼                                                       ▼
-Input Video/Sequence                                     Rough Masks
-       │                                                       │
-       ▼                                                       ▼
-┌─────────────────┐                               ┌─────────────────────┐
-│ Frame Extraction │                               │ Depth Anything V2   │
-└────────┬────────┘                               │   (per frame)       │
-         │                                        └──────────┬──────────┘
-         ▼                                                   │
-┌─────────────────┐     ┌──────────────────┐                 ▼
-│  GroundingDINO  │ OR  │  Interactive     │      ┌─────────────────────┐
-│  (text prompt)  │     │  (point/box)     │      │   Depth Edge Map    │
-└────────┬────────┘     └────────┬─────────┘      └──────────┬──────────┘
-         │                       │                           │
-         └───────────┬───────────┘                           ▼
-                     ▼                            ┌─────────────────────┐
-          ┌─────────────────┐                     │  Edge Comparison    │
-          │     SAM 2.1     │                     │  • Hard edges       │
-          │ (video predict) │                     │  • Soft regions     │
-          │                 │                     │  • Alignment fix    │
-          │ • Temporal mem  │                     └──────────┬──────────┘
-          │ • Multi-object  │                                │
-          │ • Bi-direction  │                                ▼
-          └────────┬────────┘                     ┌─────────────────────┐
-                   │                              │   Guided Filter     │
-                   ▼                              │   + Edge Refine     │
-          ┌─────────────────┐                     └──────────┬──────────┘
-          │  Rough Masks    │                                │
-          │  (binary/soft)  │ ◄──────────────────────────────┘
-          └────────┬────────┘
-                   │
-                   ▼
-          ┌─────────────────┐
-          │  EXR Export     │
-          │  (16-bit float) │
-          └─────────────────┘
-```
-
----
-
-## ⚠️ Troubleshooting
-
-### "CUDA out of memory"
-```bash
-# Use smaller model
-python auto_roto.py --input video.mp4 --prompt "person" --sam-model small
-
-# Or process at lower resolution (resize video first)
-ffmpeg -i video.mp4 -vf scale=1280:-1 video_small.mp4
-```
-
-### "GroundingDINO not found"
-```bash
-# Text prompts require GroundingDINO
-# Install it or use box/point prompts instead
-python auto_roto.py --input video.mp4 --box "100,100,500,400"
-```
-
-### "OpenEXR not available"
-```bash
-# EXR output falls back to OpenCV (limited)
-# For full EXR support, install OpenEXR:
-sudo apt-get install libopenexr-dev
-pip install OpenEXR
-```
-
-### Flickering between frames
-```bash
-# Ensure backward propagation is enabled (default)
-# Use larger model for better temporal consistency
-python auto_roto.py --input video.mp4 --prompt "person" --sam-model large
-```
-
-### Poor edge quality
-```bash
-# Increase refinement
-python auto_roto.py --input video.mp4 --prompt "person" \
-    --refine-iterations 5 --edge-softness 2.0
-```
-
----
-
-## 📊 Performance
+## Performance
 
 | Model | VRAM | Speed (1080p) | Quality |
 |-------|------|---------------|---------|
@@ -459,32 +263,32 @@ python auto_roto.py --input video.mp4 --prompt "person" \
 | base_plus | ~7GB | ~25 FPS | Great |
 | large | ~12GB | ~15 FPS | Best |
 
-*Benchmarks on RTX 4090, may vary based on video complexity*
+*Benchmarks on RTX 4090, varies by video complexity*
 
 ---
 
-## 🔮 Roadmap
+## Roadmap
 
 - [ ] Nuke plugin for in-app processing
 - [ ] GUI interface (Gradio/Streamlit)
-- [ ] Deep matting models (RVM, ViTMatte) for even better alpha
-- [ ] Batch processing multiple videos
 - [ ] Cloud processing option
+- [ ] Real-time preview mode
 
 ---
 
-## 📜 License
+## License
 
 MIT License - use freely in commercial projects.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - [SAM2](https://github.com/facebookresearch/sam2) by Meta AI
 - [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO) by IDEA Research
-- [Grounded-SAM](https://github.com/IDEA-Research/Grounded-Segment-Anything) for inspiration
+- [Depth Anything](https://github.com/DepthAnything/Depth-Anything-V2) by Depth Anything team
+- [ViTMatte](https://huggingface.co/docs/transformers/model_doc/vitmatte) via HuggingFace Transformers
 
 ---
 
-**Built for VFX artists who need reliable auto-roto. No more hand-painting frames for simple shots.**
+**Built for VFX artists who need reliable auto-roto.**
