@@ -97,8 +97,8 @@ class TrimapConfig:
     # Formulaic EROSION (Smart Core) - how deep to erode based on complexity
     # Smooth regions (complexity 0) → erode base_px (safety margin only)
     # Complex regions like hair (complexity 1) → erode up to base + max px (deep root blending)
-    erosion_base_px: float = 1.0        # Minimum erosion (smooth regions like shoulders)
-    erosion_max_px: float = 14.0        # Additional erosion for complex regions (hair roots)
+    erosion_base_px: float = 2.0        # Minimum erosion (smooth regions like shoulders)
+    erosion_max_px: float = 40.0        # Additional erosion for complex regions (hair roots)
 
     # Formulaic DILATION (Dynamic Reach) - how far to search based on complexity
     # Smooth regions → base_px reach, Complex regions → base + max reach
@@ -119,7 +119,7 @@ class ViTMatteConfig:
 
     model_size: str = "base"        # "small" or "base"
     device: str = "cuda"
-    max_resolution: int = 2048      # Max dimension for processing (resize if larger)
+    max_resolution: int = 8192      # Max dimension for processing (resize if larger)
 
 
 @dataclass
@@ -486,11 +486,11 @@ class TrimapSynthesizer:
         # =====================================================================
         # STEP 4: FORMULAIC EROSION (The "Smart Core")
         # =====================================================================
-        # Increase the multiplier from 14.0 to 40.0
-        # This forces the solid white core to retreat much deeper into the hair
-
-        # Base 2.0 (tighter shoulder) + 40.0 (deep hair retreat)
-        erosion_threshold = 2.0 + (40.0 * complexity_map)
+        # Base + Max (configurable) for deeper hair retreat
+        erosion_threshold = (
+            self.config.erosion_base_px +
+            (self.config.erosion_max_px * complexity_map)
+        )
 
         # Create the Dynamic Core
         # A pixel is core ONLY if it is deep enough inside (beyond erosion threshold)
@@ -1169,7 +1169,7 @@ class GeometricMatteRefiner:
                 )
 
                 # =====================================================================
-                # STAGE 3.5: HAIR DENSITY & POLISH (The "VFX Look")
+                # STAGE 3.5: HAIR DENSITY & POLISH (The "Punch" Configuration)
                 # =====================================================================
                 # Only apply this to the "Unknown" region (hair/edges)
                 detail_region = (trimap == 128)
@@ -1178,19 +1178,17 @@ class GeometricMatteRefiner:
                     # 1. Extract the detail alpha
                     hair_alpha = alpha_refined[detail_region]
 
-                    # 2. GAMMA BOOST (Thickens the strands)
-                    # Standard "Hair Gamma" is 0.7 - 0.8
-                    # Lower number = Thicker hair
-                    hair_gamma = 0.75
-                    hair_alpha = np.power(hair_alpha, hair_gamma)
+                    # 2. GAMMA: 0.5 (Square Root) - THE KEY TO DETAIL
+                    # Turns faint 25% opacity strands into 50% visible strands
+                    hair_alpha = np.power(hair_alpha, 0.5)
 
-                    # 3. BLACK POINT CRUSH (Cleans the "fizz")
-                    # Removes faint noise (< 5% opacity) that causes halos
-                    hair_alpha = np.maximum(0, hair_alpha - 0.02)
+                    # 3. BLACK POINT: 0.05 (Aggressive Cleanup)
+                    # Kills the background noise boosted by the gamma
+                    hair_alpha = np.maximum(0, hair_alpha - 0.05)
 
-                    # 4. GAIN (Solidifies the mass)
-                    # Pushes 80% opacity to 100%
-                    hair_alpha = hair_alpha * 1.1
+                    # 4. GAIN: 1.4 (Solidify)
+                    # Forces the "spine" of the curl to be 100% white
+                    hair_alpha = hair_alpha * 1.4
 
                     # Write back
                     alpha_refined[detail_region] = hair_alpha
@@ -1396,10 +1394,10 @@ EXAMPLES:
                        help="Blur kernel for complexity field smoothing (default: 21)")
 
     # Formulaic EROSION (Smart Core)
-    parser.add_argument("--erosion-base", type=float, default=1.0,
-                       help="Minimum erosion for smooth regions like shoulders (default: 1)")
-    parser.add_argument("--erosion-max", type=float, default=14.0,
-                       help="Additional erosion for complex regions like hair roots (default: 14)")
+    parser.add_argument("--erosion-base", type=float, default=2.0,
+                       help="Minimum erosion for smooth regions like shoulders (default: 2)")
+    parser.add_argument("--erosion-max", type=float, default=40.0,
+                       help="Additional erosion for complex regions like hair roots (default: 40)")
 
     # Formulaic DILATION (Dynamic Reach)
     parser.add_argument("--adaptive-base", type=float, default=2.0,
@@ -1418,8 +1416,8 @@ EXAMPLES:
     # ViTMatte settings
     parser.add_argument("--model-size", choices=["small", "base"], default="base",
                        help="ViTMatte model size (default: base)")
-    parser.add_argument("--max-resolution", type=int, default=2048,
-                       help="Max resolution for processing (resize if larger, default: 2048)")
+    parser.add_argument("--max-resolution", type=int, default=8192,
+                       help="Max resolution for processing (resize if larger, default: 8192)")
 
     # Output settings
     parser.add_argument("--format", choices=["exr", "png"], default="exr",
