@@ -7,7 +7,7 @@ os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 DEPTH-GUIDED ALPHA REFINEMENT
 =============================
 
-Uses Depth Anything V2 to refine alpha mattes from AUTO-ROTO.
+Uses Depth Anything 3 (DA3) to refine alpha mattes from AUTO-ROTO.
 
 Depth discontinuities indicate object boundaries, which helps:
   - Sharpen edges where depth changes abruptly
@@ -64,7 +64,7 @@ class DepthRefineConfig:
     output_dir: str = "./refined"
     
     # Depth model settings
-    depth_model: str = "large"    # small, base, large
+    depth_model: str = "nested-large"    # small, base, large, nested-base, nested-large
     compute_depth: bool = True    # Compute depth if not provided
     save_depth: bool = True       # Save depth maps for reuse
     
@@ -110,27 +110,43 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 
 
 # ==============================================================================
-# DEPTH ANYTHING V2 WRAPPER
+# DEPTH ANYTHING V3 WRAPPER
 # ==============================================================================
 
 class DepthEstimator:
     """
-    Wrapper for Depth Anything V2 monocular depth estimation.
+    Wrapper for Depth Anything 3 monocular depth estimation.
     
     Outputs relative depth maps (not metric) which is perfect for
     edge detection and refinement.
     """
-    
-    MODEL_CONFIGS = {
-        'small': ('depth_anything_v2_vits.pth', 'vits'),
-        'base': ('depth_anything_v2_vitb.pth', 'vitb'),
-        'large': ('depth_anything_v2_vitl.pth', 'vitl'),
+
+    MODEL_NAME_BY_SIZE = {
+        "small": "depth-anything/DA3-Small",
+        "base": "depth-anything/DA3-Base",
+        "large": "depth-anything/DA3Mono-Large",
+        # Nested models - designed for higher resolution, use larger tiles
+        "nested-large": "depth-anything/DA3NESTED-GIANT-LARGE",
+        "nested-base": "depth-anything/DA3NESTED-Base",
     }
-    
-    CHECKPOINT_URLS = {
-        'small': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Small/resolve/main/depth_anything_v2_vits.pth',
-        'base': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Base/resolve/main/depth_anything_v2_vitb.pth',
-        'large': 'https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth',
+
+    # Maximum process_res by model (nested handles higher res natively)
+    # These are the max resolutions the model can process in a single pass
+    MAX_PROCESS_RES_BY_MODEL = {
+        "small": 768,
+        "base": 1024,
+        "large": 1024,
+        "nested-large": 2048,   # Nested architecture handles higher res natively
+        "nested-base": 1536,
+    }
+
+    # Whether model supports direct high-res (no tiling needed)
+    SUPPORTS_DIRECT_HIGHRES = {
+        "small": False,
+        "base": False,
+        "large": False,
+        "nested-large": True,   # Nested models process high-res directly
+        "nested-base": True,
     }
     
     def __init__(
@@ -142,145 +158,82 @@ class DepthEstimator:
         self.model_size = model_size
         self.device = device
         self.logger = logger or logging.getLogger("DepthEstimator")
-        
+
         self.model = None
         self._load_model()
+
+    def get_max_process_res(self) -> int:
+        """Get max process_res for the loaded model."""
+        return self.MAX_PROCESS_RES_BY_MODEL.get(self.model_size, 1024)
+
+    def supports_direct_highres(self) -> bool:
+        """Check if model supports direct high-res processing (no tiling)."""
+        return self.SUPPORTS_DIRECT_HIGHRES.get(self.model_size, False)
     
     def _load_model(self):
-        """Load Depth Anything V2 model."""
-        import torch
+        """Load Depth Anything 3 model."""
         import sys
 
-        self.logger.info(f"Loading Depth Anything V2 ({self.model_size})...")
+        model_name = self.MODEL_NAME_BY_SIZE.get(self.model_size, self.MODEL_NAME_BY_SIZE["large"])
+        self.logger.info(f"Loading Depth Anything 3 ({model_name})...")
 
-        checkpoint_name, encoder = self.MODEL_CONFIGS[self.model_size]
-        checkpoint_path = self._ensure_checkpoint(checkpoint_name)
+        # Add Depth-Anything-3 repo to path if it exists locally
+        script_dir = Path(__file__).parent
+        depth_repo = script_dir / "Depth-Anything-3"
+        if depth_repo.exists() and str(depth_repo) not in sys.path:
+            sys.path.insert(0, str(depth_repo))
 
-        try:
-            # Add Depth-Anything-V2 repo to path if it exists
-            script_dir = Path(__file__).parent
-            depth_repo = script_dir / "Depth-Anything-V2"
-            if depth_repo.exists() and str(depth_repo) not in sys.path:
-                sys.path.insert(0, str(depth_repo))
+        from depth_anything_3.api import DepthAnything3
 
-            # Try loading via the official depth_anything_v2 module
-            from depth_anything_v2.dpt import DepthAnythingV2
-            
-            model_configs = {
-                'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-                'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-                'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-            }
-            
-            self.model = DepthAnythingV2(**model_configs[encoder])
-            self.model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-            self.model = self.model.to(self.device).eval()
-            
-        except ImportError:
-            # Fallback: use Hugging Face Transformers
-            self.logger.info("Using Hugging Face Transformers for Depth Anything V2")
-            
-            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
-            
-            model_id = f"depth-anything/Depth-Anything-V2-{self.model_size.capitalize()}"
-            
-            self.processor = AutoImageProcessor.from_pretrained(model_id)
-            self.model = AutoModelForDepthEstimation.from_pretrained(model_id)
-            self.model = self.model.to(self.device).eval()
-            self._use_transformers = True
-        
-        self.logger.info("Depth Anything V2 loaded successfully")
+        self.model = DepthAnything3.from_pretrained(model_name)
+        self.model = self.model.to(self.device).eval()
+
+        self.logger.info("Depth Anything 3 loaded successfully")
     
-    def _ensure_checkpoint(self, checkpoint_name: str) -> Path:
-        """Ensure checkpoint exists, download if needed."""
-        import urllib.request
-        
-        cache_dir = Path.home() / ".cache" / "depth_anything_v2"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        checkpoint_path = cache_dir / checkpoint_name
-        
-        if not checkpoint_path.exists():
-            url = self.CHECKPOINT_URLS[self.model_size]
-            self.logger.info(f"Downloading {checkpoint_name}...")
-            urllib.request.urlretrieve(url, checkpoint_path)
-            self.logger.info("Download complete")
-        
-        return checkpoint_path
-    
-    def estimate(self, image: np.ndarray) -> np.ndarray:
+    def estimate(self, image: np.ndarray, process_res: int = None) -> np.ndarray:
         """
         Estimate depth from RGB image.
-        
+
         Args:
             image: RGB image (H, W, 3), uint8 or float
-            
+            process_res: Processing resolution (default: use model's max)
+
         Returns:
             Depth map (H, W), float32, normalized 0-1 (closer = lower values)
         """
         import torch
         import cv2
-        
+
         # Ensure proper format
         if image.dtype != np.uint8:
             image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
-        
+
         h, w = image.shape[:2]
-        
-        if hasattr(self, '_use_transformers') and self._use_transformers:
-            # Hugging Face Transformers path
-            from PIL import Image
-            
-            pil_image = Image.fromarray(image)
-            inputs = self.processor(images=pil_image, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-            
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-                depth = outputs.predicted_depth
-            
-            # Resize to original size
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(1),
-                size=(h, w),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-            
-            depth = depth.cpu().numpy()
-            
+
+        # Determine process_res: use provided, or model's max, capped at image size
+        max_res = self.get_max_process_res()
+        if process_res is None:
+            process_res = min(max(h, w), max_res)
         else:
-            # Official DepthAnythingV2 path
-            # Resize to model input size (518 is default)
-            input_size = 518
-            img_resized = cv2.resize(image, (input_size, input_size))
-            
-            # Normalize
-            img_tensor = torch.from_numpy(img_resized).permute(2, 0, 1).float()
-            img_tensor = img_tensor / 255.0
-            img_tensor = img_tensor.unsqueeze(0).to(self.device)
-            
-            # Normalize with ImageNet stats
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
-            img_tensor = (img_tensor - mean) / std
-            
-            with torch.no_grad():
-                depth = self.model(img_tensor)
-            
-            # Resize back to original size
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(1),
-                size=(h, w),
-                mode="bicubic",
-                align_corners=False
-            ).squeeze()
-            
-            depth = depth.cpu().numpy()
-        
+            process_res = min(process_res, max_res)
+
+        self.logger.debug(f"Estimating depth at process_res={process_res} (image: {w}x{h})")
+
+        with torch.no_grad():
+            prediction = self.model.inference(
+                [image],
+                process_res=process_res,
+                process_res_method="upper_bound_resize",
+            )
+        depth = prediction.depth[0]
+
+        # Resize depth to match input image size
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
         # Normalize to 0-1
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-        
+
         return depth.astype(np.float32)
     
     def estimate_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
@@ -296,17 +249,14 @@ class DepthEstimator:
         mask: np.ndarray = None
     ) -> np.ndarray:
         """
-        Estimate depth at higher resolution using tiled processing.
+        Estimate depth at higher resolution.
 
-        For 4K footage, the standard 518x518 resolution loses fine detail.
-        This method processes overlapping tiles and blends them together.
-
-        If a mask is provided, only process tiles that overlap with the mask
-        (optimization for rotoscoping where we only care about subject edges).
+        For nested models (DA3NESTED), uses direct high-res processing.
+        For other models, uses tiled processing with blending.
 
         Args:
             image: RGB image (H, W, 3), uint8
-            tile_size: Size of each tile (default 1024 for good detail)
+            tile_size: Size of each tile for non-nested models (default 1024)
             overlap: Overlap between tiles for blending (default 256)
             mask: Optional alpha mask - only process tiles overlapping mask edges
 
@@ -321,6 +271,14 @@ class DepthEstimator:
 
         h, w = image.shape[:2]
 
+        # For nested models: use direct high-res processing (no tiling needed)
+        if self.supports_direct_highres():
+            max_res = self.get_max_process_res()
+            process_res = min(max(h, w), max_res)
+            self.logger.info(f"Direct high-res depth: {w}x{h} at process_res={process_res}")
+            return self.estimate(image, process_res=process_res)
+
+        # For non-nested models: use tiled processing
         # If image is smaller than tile size, just use regular estimation
         if h <= tile_size and w <= tile_size:
             return self.estimate(image)
@@ -385,6 +343,10 @@ class DepthEstimator:
 
                 # Estimate depth for this tile
                 tile_depth = self.estimate(tile)
+
+                # DA3 may return different dimensions - resize to match tile
+                if tile_depth.shape != (tile_size, tile_size):
+                    tile_depth = cv2.resize(tile_depth, (tile_size, tile_size), interpolation=cv2.INTER_LINEAR)
 
                 # Crop back to original tile size
                 tile_depth = tile_depth[:tile_h, :tile_w]
@@ -1440,13 +1402,13 @@ class DepthRefinePipeline:
                     else:
                         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    self.logger.debug(f"  Computing high-res depth (tiled) from {frame_path.name}...")
-                    # Use high-res tiled depth estimation, optimized with mask
+                    self.logger.debug(f"  Computing depth from {frame_path.name}...")
+                    self.logger.debug(f"  Model: {self.config.depth_model}")
+                    # Use high-res depth estimation
+                    # Nested models process directly; others use tiling
                     depth = self.depth_estimator.estimate_high_res(
                         frame,
-                        tile_size=1024,
-                        overlap=256,
-                        mask=alpha  # Only process tiles near the subject
+                        mask=alpha  # Only process tiles near the subject (for tiled models)
                     )
 
                     if self.config.save_depth:
@@ -1577,9 +1539,9 @@ EXAMPLES:
                        help="Output directory")
     
     # Depth model
-    parser.add_argument("--depth-model", default="large",
-                       choices=["small", "base", "large"],
-                       help="Depth Anything V2 model size")
+    parser.add_argument("--depth-model", default="nested-large",
+                       choices=["small", "base", "large", "nested-base", "nested-large"],
+                       help="Depth Anything 3 model (nested-large recommended for best quality)")
     parser.add_argument("--no-save-depth", action="store_true",
                        help="Don't save computed depth maps")
     
