@@ -64,7 +64,7 @@ class EdgeRefineConfig:
     antialias_strength: float = 1.0      # 0-2, AA filter strength
 
     # Core operations
-    core_shrink: int = 3                 # Pixels to shrink core
+    core_erosion: int = 5                # Pixels to erode core (standardized across all stages)
     edge_extend: int = 2                 # Pixels to extend edge outward
 
 
@@ -587,10 +587,10 @@ class EdgeRefiner:
         subpixel_edges = self.subpixel_detector.detect(alpha)
 
         # Step 3: Apply core shrink
-        if self.config.core_shrink > 0:
+        if self.config.core_erosion > 0:
             shrink_kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE,
-                (self.config.core_shrink * 2 + 1, self.config.core_shrink * 2 + 1)
+                (self.config.core_erosion * 2 + 1, self.config.core_erosion * 2 + 1)
             )
             core = cv2.erode(core, shrink_kernel, iterations=1)
 
@@ -843,8 +843,8 @@ def parse_args():
                        help="Inner edge band width (default: 8)")
     parser.add_argument("--outer-band", type=int, default=12,
                        help="Outer edge band width (default: 12)")
-    parser.add_argument("--core-shrink", type=int, default=3,
-                       help="Core shrink pixels (default: 3)")
+    parser.add_argument("--core-erosion", type=int, default=5,
+                       help="Core erosion pixels (default: 5)")
     parser.add_argument("--edge-extend", type=int, default=2,
                        help="Edge extend pixels (default: 2)")
 
@@ -875,7 +875,7 @@ def main():
     config = EdgeRefineConfig(
         inner_band_width=args.inner_band,
         outer_band_width=args.outer_band,
-        core_shrink=args.core_shrink,
+        core_erosion=args.core_erosion,
         edge_extend=args.edge_extend,
         edge_softness=args.softness,
         falloff_gamma=args.gamma,

@@ -6,15 +6,23 @@ Provides a registry-based pipeline architecture that eliminates repeated pattern
 in the orchestrator and enables procedural stage execution.
 
 Usage:
+    from pathlib import Path
     from stages import StageRegistry, StageContext, create_default_registry
+    from full_pipeline_v5 import PipelineConfig
 
-    registry = create_default_registry()
-    context = StageContext(
+    # Create config (single source of truth for all settings)
+    config = PipelineConfig(
         input_path="/path/to/input",
-        output_base=Path("/path/to/output"),
-        settings={"skip_depth": True, "prompt": "person"}
+        output_dir="/path/to/output",
+        prompt="person",
+        quality="high",
     )
 
+    # Create context from config (no manual settings dict needed)
+    context = StageContext.from_pipeline_config(config, Path(config.output_dir))
+
+    # Run all enabled stages
+    registry = create_default_registry()
     results = registry.run_all(context, script_dir=Path(__file__).parent)
 """
 

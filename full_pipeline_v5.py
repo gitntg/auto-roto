@@ -95,7 +95,7 @@ class PipelineConfig:
 
     # Edge refinement
     edge_softness: float = 1.0
-    core_shrink: int = 3
+    core_erosion: int = 5  # Pixels to erode core (standardized across all stages)
     despill_strength: float = 0.5
 
     # Temporal smoothing
@@ -350,7 +350,7 @@ def run_pipeline(config: PipelineConfig):
             "--output", str(vitmatte_output),
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
-            "--core-erosion", "10",
+            "--core-erosion", str(config.core_erosion),
             "--adaptive-base", str(config.vitmatte_adaptive_base),
             "--adaptive-max", str(config.vitmatte_adaptive_max),
             "--save-trimap",
@@ -392,7 +392,7 @@ def run_pipeline(config: PipelineConfig):
             "--output", str(edge_output),
             "--frames", config.input_path,
             "--softness", str(config.edge_softness),
-            "--core-shrink", str(config.core_shrink),
+            "--core-erosion", str(config.core_erosion),
             "--despill", str(config.despill_strength),
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
@@ -468,7 +468,7 @@ def run_pipeline(config: PipelineConfig):
             "--alpha", str(alpha_source),
             "--output", str(combine_output),
             "--frames", config.input_path,
-            "--core-erosion", str(config.core_shrink),
+            "--core-erosion", str(config.core_erosion),
             "--despill", str(config.despill_strength),
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
@@ -668,7 +668,7 @@ QUALITY PRESETS:
                        help="Override SAM2 model size")
     parser.add_argument("--depth-model",
                        choices=["small", "base", "large", "nested-base", "nested-large"],
-                       help="Override Depth model (nested-large best for hair detail)")
+                       help="Override Depth model (large=DA3Mono best for hair detail)")
 
     # ViTMatte settings (adaptive trimap)
     parser.add_argument("--vitmatte-motion", action="store_true",
@@ -681,8 +681,8 @@ QUALITY PRESETS:
     # Edge settings
     parser.add_argument("--edge-softness", type=float, default=1.0,
                        help="Edge softness (default: 1.0)")
-    parser.add_argument("--core-shrink", type=int, default=3,
-                       help="Core shrink pixels (default: 3)")
+    parser.add_argument("--core-erosion", type=int, default=5,
+                       help="Core erosion pixels for edge refinement (default: 5)")
     parser.add_argument("--despill", type=float, default=0.5,
                        help="Despill strength (default: 0.5)")
 
@@ -731,7 +731,7 @@ def main():
         vitmatte_adaptive_base=args.vitmatte_base,
         vitmatte_adaptive_max=args.vitmatte_max,
         edge_softness=args.edge_softness,
-        core_shrink=args.core_shrink,
+        core_erosion=args.core_erosion,
         despill_strength=args.despill,
         temporal_window=args.temporal_window,
         keyframe_interval=args.keyframe_interval,

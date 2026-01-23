@@ -32,7 +32,7 @@ class SAMStage(PipelineStage):
         return True  # Pipeline can't continue without initial segmentation
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_sam", False)
+        return not context.settings["skip_sam"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         args = [
@@ -45,9 +45,9 @@ class SAMStage(PipelineStage):
         ]
 
         # Add prompt type
-        prompt = context.settings.get("prompt", "")
-        box = context.settings.get("box", "")
-        interactive = context.settings.get("interactive", False)
+        prompt = context.settings["prompt"]
+        box = context.settings["box"]
+        interactive = context.settings["interactive"]
 
         if prompt:
             args.extend(["--prompt", prompt])
@@ -82,7 +82,7 @@ class DepthStage(PipelineStage):
         return "depth_refine.py"
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_depth", False)
+        return not context.settings["skip_depth"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         # Find alpha source from SAM output
@@ -131,7 +131,7 @@ class ViTMatteStage(PipelineStage):
         return "vitmatte_refine.py"
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_vitmatte", False)
+        return not context.settings["skip_vitmatte"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         # Find sources
@@ -145,13 +145,13 @@ class ViTMatteStage(PipelineStage):
             "--output", str(output_dir),
             "--format", context.output_format,
             "--bit-depth", str(context.bit_depth),
-            "--core-erosion", "10",
-            "--adaptive-base", str(context.settings.get("vitmatte_adaptive_base", 2.0)),
-            "--adaptive-max", str(context.settings.get("vitmatte_adaptive_max", 60.0)),
+            "--core-erosion", str(context.settings["core_erosion"]),
+            "--adaptive-base", str(context.settings["vitmatte_adaptive_base"]),
+            "--adaptive-max", str(context.settings["vitmatte_adaptive_max"]),
             "--save-trimap",
         ]
 
-        if context.settings.get("vitmatte_motion_aware", False):
+        if context.settings["vitmatte_motion_aware"]:
             args.append("--motion-aware")
 
         if context.verbose:
@@ -195,7 +195,7 @@ class EdgeStage(PipelineStage):
         return "edge_refine.py"
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_edge", False)
+        return not context.settings["skip_edge"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         alpha_source = self._find_alpha_source(context)
@@ -204,9 +204,9 @@ class EdgeStage(PipelineStage):
             "--alpha", str(alpha_source),
             "--output", str(output_dir),
             "--frames", context.input_path,
-            "--softness", str(context.settings.get("edge_softness", 1.0)),
-            "--core-shrink", str(context.settings.get("core_shrink", 3)),
-            "--despill", str(context.settings.get("despill_strength", 0.5)),
+            "--softness", str(context.settings["edge_softness"]),
+            "--core-erosion", str(context.settings["core_erosion"]),
+            "--despill", str(context.settings["despill_strength"]),
             "--format", context.output_format,
             "--bit-depth", str(context.bit_depth),
         ]
@@ -246,7 +246,7 @@ class TemporalStage(PipelineStage):
         return "temporal_smooth.py"
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_temporal", False)
+        return not context.settings["skip_temporal"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         alpha_source = self._find_alpha_source(context)
@@ -255,8 +255,8 @@ class TemporalStage(PipelineStage):
             "--alpha", str(alpha_source),
             "--output", str(output_dir),
             "--frames", context.input_path,
-            "--window", str(context.settings.get("temporal_window", 5)),
-            "--keyframe-interval", str(context.settings.get("keyframe_interval", 30)),
+            "--window", str(context.settings["temporal_window"]),
+            "--keyframe-interval", str(context.settings["keyframe_interval"]),
             "--format", context.output_format,
             "--bit-depth", str(context.bit_depth),
         ]
@@ -295,7 +295,7 @@ class CombineStage(PipelineStage):
         return "matte_combine.py"
 
     def is_enabled(self, context: StageContext) -> bool:
-        return not context.settings.get("skip_combine", False)
+        return not context.settings["skip_combine"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         alpha_source = self._find_alpha_source(context)
@@ -304,8 +304,8 @@ class CombineStage(PipelineStage):
             "--alpha", str(alpha_source),
             "--output", str(output_dir),
             "--frames", context.input_path,
-            "--core-erosion", str(context.settings.get("core_shrink", 3)),
-            "--despill", str(context.settings.get("despill_strength", 0.5)),
+            "--core-erosion", str(context.settings["core_erosion"]),
+            "--despill", str(context.settings["despill_strength"]),
             "--format", context.output_format,
             "--bit-depth", str(context.bit_depth),
         ]
@@ -345,7 +345,7 @@ class HairStage(PipelineStage):
 
     def is_enabled(self, context: StageContext) -> bool:
         # Hair refinement is disabled by default
-        return not context.settings.get("skip_hair", True)
+        return not context.settings["skip_hair"]
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
         sam_alpha = self._find_sam_alpha(context)

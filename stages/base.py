@@ -85,6 +85,49 @@ class StageContext:
             return self.current_alpha
         raise ValueError("No alpha source available yet")
 
+    @classmethod
+    def from_pipeline_config(cls, config: Any, output_base: Path) -> "StageContext":
+        """
+        Create StageContext from a PipelineConfig.
+        
+        This is the SINGLE SOURCE OF TRUTH for settings - no fallback defaults
+        should exist in stage build_args() methods.
+        """
+        return cls(
+            input_path=config.input_path,
+            output_base=output_base,
+            verbose=config.verbose,
+            output_format=config.output_format,
+            bit_depth=config.bit_depth,
+            sam_model=config.sam_model,
+            depth_model=config.depth_model,
+            settings={
+                # Detection
+                "prompt": config.prompt,
+                "box": config.box,
+                "interactive": config.interactive,
+                # Stage skip flags
+                "skip_sam": config.skip_sam,
+                "skip_depth": config.skip_depth,
+                "skip_vitmatte": config.skip_vitmatte,
+                "skip_edge": config.skip_edge,
+                "skip_temporal": config.skip_temporal,
+                "skip_combine": config.skip_combine,
+                "skip_hair": config.skip_hair,
+                # ViTMatte settings
+                "vitmatte_motion_aware": config.vitmatte_motion_aware,
+                "vitmatte_adaptive_base": config.vitmatte_adaptive_base,
+                "vitmatte_adaptive_max": config.vitmatte_adaptive_max,
+                # Edge/combine settings (SINGLE SOURCE - no fallbacks!)
+                "core_erosion": config.core_erosion,
+                "edge_softness": config.edge_softness,
+                "despill_strength": config.despill_strength,
+                # Temporal settings
+                "temporal_window": config.temporal_window,
+                "keyframe_interval": config.keyframe_interval,
+            },
+        )
+
 
 class PipelineStage(ABC):
     """
