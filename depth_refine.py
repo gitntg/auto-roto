@@ -1592,22 +1592,22 @@ class DepthRefinePipeline:
 
     def release(self) -> None:
         """Release all resources and free GPU memory."""
-        if self._depth_estimator is not None:
-            self._depth_estimator.release()
-            self._depth_estimator = None
-        
-        if self._refiner is not None:
-            self._refiner = None
-        
-        # Clear GPU memory
         try:
+            if self._depth_estimator is not None:
+                self._depth_estimator.release()
+                self._depth_estimator = None
+            
+            if self._refiner is not None:
+                self._refiner = None
+            
+            # Clear GPU memory
             import torch
             import gc
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             gc.collect()
-        except ImportError:
+        except Exception:
             pass
 
     def __del__(self):

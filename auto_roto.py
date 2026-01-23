@@ -1011,23 +1011,25 @@ class SAM2Segmenter:
 
     def release(self) -> None:
         """Release model and free GPU memory."""
-        import torch
-        import gc
-        
-        if self.predictor is not None:
-            del self.predictor
-            self.predictor = None
-        
-        if self.state is not None:
-            del self.state
-            self.state = None
-        
-        self.logger.debug("SAM2Segmenter model released")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        gc.collect()
+        try:
+            if self.predictor is not None:
+                del self.predictor
+                self.predictor = None
+            
+            if self.state is not None:
+                del self.state
+                self.state = None
+            
+            self.logger.debug("SAM2Segmenter model released")
+            
+            import torch
+            import gc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except Exception:
+            pass
 
     def __del__(self):
         """Destructor to ensure cleanup."""
@@ -1212,20 +1214,22 @@ class GroundingDINODetector:
 
     def release(self) -> None:
         """Release model and free GPU memory."""
-        import torch
-        import gc
-        
-        if self.model is not None:
-            del self.model
-            self.model = None
-            self.predict_fn = None
-        
-        self.logger.debug("GroundingDINODetector model released")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        gc.collect()
+        try:
+            if self.model is not None:
+                del self.model
+                self.model = None
+                self.predict_fn = None
+            
+            self.logger.debug("GroundingDINODetector model released")
+            
+            import torch
+            import gc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except Exception:
+            pass
 
     def __del__(self):
         """Destructor to ensure cleanup."""
@@ -1496,11 +1500,17 @@ class AutoRotoPipeline:
     def release(self) -> None:
         """Release all resources and free GPU memory."""
         if self._sam is not None:
-            self._sam.release()
+            try:
+                self._sam.release()
+            except Exception:
+                pass
             self._sam = None
         
         if self._detector is not None:
-            self._detector.release()
+            try:
+                self._detector.release()
+            except Exception:
+                pass
             self._detector = None
         
         if self._refiner is not None:
@@ -1512,7 +1522,7 @@ class AutoRotoPipeline:
         if self._writer is not None:
             self._writer = None
         
-        # Clear GPU memory
+        # Clear GPU memory (defensive - may fail during shutdown)
         try:
             import torch
             import gc
@@ -1520,7 +1530,7 @@ class AutoRotoPipeline:
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             gc.collect()
-        except ImportError:
+        except Exception:
             pass
 
     def __del__(self):

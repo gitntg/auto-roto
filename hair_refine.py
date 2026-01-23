@@ -280,24 +280,27 @@ class ViTMatteRefiner:
 
     def release(self) -> None:
         """Release model and free GPU memory."""
-        import torch
-        import gc
-        
-        if self.model is not None:
-            try:
-                self.model = self.model.to('cpu')
-            except Exception:
-                pass
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
-            self.logger.debug("ViTMatteRefiner model released")
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        gc.collect()
+        try:
+            import torch
+            import gc
+            
+            if self.model is not None:
+                try:
+                    self.model = self.model.to('cpu')
+                except Exception:
+                    pass
+                del self.model
+                del self.processor
+                self.model = None
+                self.processor = None
+                self.logger.debug("ViTMatteRefiner model released")
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except Exception:
+            pass
 
     def __del__(self):
         """Destructor to ensure cleanup."""
