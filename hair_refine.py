@@ -278,6 +278,43 @@ class ViTMatteRefiner:
         trimap = generate_trimap(mask, erode_size, dilate_size)
         return self.refine(image, trimap)
 
+    def release(self) -> None:
+        """Release model and free GPU memory."""
+        try:
+            import torch
+            import gc
+            
+            if self.model is not None:
+                try:
+                    self.model = self.model.to('cpu')
+                except Exception:
+                    pass
+                del self.model
+                del self.processor
+                self.model = None
+                self.processor = None
+                self.logger.debug("ViTMatteRefiner model released")
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except Exception:
+            pass
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
+
 
 # ==============================================================================
 # FILE I/O (reuse from depth_refine.py patterns)
@@ -604,6 +641,36 @@ class HairRefinementPipeline:
         ])
 
         cv2.imwrite(str(path), comparison)
+
+    def release(self) -> None:
+        """Release all resources and free GPU memory."""
+        if self._refiner is not None:
+            self._refiner.release()
+            self._refiner = None
+        
+        # Clear GPU memory
+        try:
+            import torch
+            import gc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except ImportError:
+            pass
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
 
 
 # ==============================================================================

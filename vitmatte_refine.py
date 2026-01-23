@@ -393,6 +393,43 @@ class TrimapSynthesizer:
 
         return complexity_map
 
+    def _compute_rgb_complexity(self, rgb: np.ndarray) -> np.ndarray:
+        """
+        Compute RGB gradient magnitude as a texture complexity factor.
+
+        Areas with high color variance (hair edges, fine detail) get high values.
+        Smooth color regions get low values.
+        """
+        import cv2
+
+        # Convert to grayscale for gradient computation
+        if rgb.ndim == 3:
+            gray = cv2.cvtColor(rgb.astype(np.float32), cv2.COLOR_RGB2GRAY)
+        else:
+            gray = rgb.astype(np.float32)
+
+        # Normalize to 0-1 range if needed
+        if gray.max() > 1.0:
+            gray = gray / 255.0
+
+        # Sobel gradients in X and Y
+        gX = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        gY = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        magnitude = cv2.magnitude(gX, gY)
+
+        # Normalize to 0-1
+        magnitude = cv2.normalize(magnitude, None, 0, 1, cv2.NORM_MINMAX).astype(np.float32)
+
+        # Gaussian blur to create "field of influence"
+        kernel_size = self.config.adaptive_blur_kernel
+        if kernel_size % 2 == 0:
+            kernel_size += 1  # Must be odd
+        complexity_map = cv2.GaussianBlur(magnitude, (kernel_size, kernel_size), 0)
+
+        self.logger.debug(f"RGB: Complexity map range: {complexity_map.min():.3f} - {complexity_map.max():.3f}")
+
+        return complexity_map
+
     def _compute_motion_factor(
         self,
         prev_frame_gray: np.ndarray,
@@ -437,6 +474,174 @@ class TrimapSynthesizer:
 
         return motion_factor
 
+    def _compute_combined_complexity(
+        self,
+        depth: np.ndarray,
+        rgb: Optional[np.ndarray],
+        h: int,
+        w: int
+    ) -> np.ndarray:
+        """
+        Compute combined complexity map from depth and optionally RGB.
+
+        Returns:
+            Complexity map with values 0.0 (smooth) to 1.0 (complex/hair-like)
+        """
+        import cv2
+
+        # Base complexity from depth gradients
+        depth_complexity = self._compute_complexity_map(depth)
+
+        # Add RGB guidance if available
+        if rgb is not None and self.config.rgb_complexity_weight > 0:
+            rgb_complexity = self._compute_rgb_complexity(rgb)
+            # Resize if needed (handling potential mismatches)
+            if rgb_complexity.shape != depth_complexity.shape:
+                rgb_complexity = cv2.resize(rgb_complexity, (w, h))
+
+            # Combine: MAX(depth, rgb) ensures we capture edges from either source
+            complexity_map = np.maximum(
+                depth_complexity,
+                rgb_complexity * self.config.rgb_complexity_weight
+            )
+        else:
+            complexity_map = depth_complexity
+
+        return complexity_map
+
+    def _compute_optional_motion_factor(
+        self,
+        h: int,
+        w: int,
+        prev_frame_gray: Optional[np.ndarray],
+        curr_frame_gray: Optional[np.ndarray]
+    ) -> np.ndarray:
+        """
+        Compute motion factor if motion-aware mode is enabled and frames are provided.
+
+        Returns:
+            Motion factor array (0.0 = static, 1.0 = fast motion)
+        """
+        motion_factor = np.zeros((h, w), dtype=np.float32)
+        if self.config.motion_aware and prev_frame_gray is not None and curr_frame_gray is not None:
+            motion_factor = self._compute_motion_factor(prev_frame_gray, curr_frame_gray)
+        return motion_factor
+
+    def _compute_distance_transforms(
+        self,
+        mask_binary: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute distance transforms for both inside and outside the mask.
+
+        Returns:
+            Tuple of (dist_inside, dist_outside) arrays.
+            - dist_inside: Distance from edge to center (for erosion)
+            - dist_outside: Distance from edge to background (for dilation)
+        """
+        import cv2
+
+        mask_255 = (mask_binary * 255).astype(np.uint8)
+
+        # dist_inside: Distance from edge to center (for EROSION)
+        dist_inside = cv2.distanceTransform(mask_255, cv2.DIST_L2, 5)
+
+        # dist_outside: Distance from edge to background (for DILATION)
+        inv_mask = cv2.bitwise_not(mask_255)
+        dist_outside = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
+
+        return dist_inside, dist_outside
+
+    def _compute_adaptive_thresholds(
+        self,
+        complexity_map: np.ndarray,
+        motion_factor: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute adaptive erosion and dilation thresholds based on complexity and motion.
+
+        Returns:
+            Tuple of (erosion_threshold, dilation_threshold) arrays.
+        """
+        # Formulaic EROSION threshold
+        # Smooth regions → erode base_px only
+        # Complex regions → erode up to base + max px
+        erosion_threshold = (
+            self.config.erosion_base_px +
+            (self.config.erosion_max_px * complexity_map)
+        )
+
+        # Formulaic DILATION threshold
+        # External reach adapts to complexity and motion
+        dilation_threshold = (
+            self.config.adaptive_base_px +
+            (self.config.adaptive_max_px * complexity_map) +
+            (self.config.motion_weight * motion_factor)
+        )
+
+        self.logger.debug(
+            f"ADAPTIVE: Erosion threshold range: {erosion_threshold.min():.1f}px - {erosion_threshold.max():.1f}px"
+        )
+        self.logger.debug(
+            f"ADAPTIVE: Dilation threshold range: {dilation_threshold.min():.1f}px - {dilation_threshold.max():.1f}px"
+        )
+
+        return erosion_threshold, dilation_threshold
+
+    def _assemble_trimap(
+        self,
+        mask_binary: np.ndarray,
+        dist_inside: np.ndarray,
+        dist_outside: np.ndarray,
+        erosion_threshold: np.ndarray,
+        dilation_threshold: np.ndarray
+    ) -> np.ndarray:
+        """
+        Assemble the final trimap using the "no-gap" method.
+
+        This guarantees no black line exists between foreground and unknown zones.
+        Everything within bounds that isn't white (core) must be grey (unknown).
+
+        Returns:
+            Trimap with values: 0 (background), 128 (unknown), 255 (foreground)
+        """
+        h, w = mask_binary.shape
+
+        # Create the Smart Core (definite foreground)
+        # A pixel is core ONLY if it is deep enough inside (beyond erosion threshold)
+        core_mask = (dist_inside > erosion_threshold).astype(np.uint8) * 255
+
+        # Define the Outer Limit (Everything that ISN'T background)
+        # Valid if inside the mask OR within dynamic reach outside
+        is_potentially_foreground = (mask_binary > 0) | (dist_outside < dilation_threshold)
+
+        # Build Trimap with "no-gap" assembly
+        trimap = np.zeros((h, w), dtype=np.uint8)
+
+        # Fill the WHOLE potential area with Grey first
+        trimap[is_potentially_foreground] = 128
+
+        # Stamp the Smart Core on top (White)
+        trimap[core_mask == 255] = 255
+
+        # Log statistics
+        fg_pixels = np.sum(trimap == 255)
+        unknown_pixels = np.sum(trimap == 128)
+        bg_pixels = np.sum(trimap == 0)
+
+        # Compute average widths for logging
+        outer_zone = (dist_outside > 0) & (dist_outside < dilation_threshold)
+        avg_dilation = np.mean(dilation_threshold[outer_zone]) if np.any(outer_zone) else 0
+        inner_zone = (dist_inside > 0) & (dist_inside <= erosion_threshold)
+        avg_erosion = np.mean(erosion_threshold[inner_zone]) if np.any(inner_zone) else 0
+
+        self.logger.info(
+            f"ADAPTIVE Trimap: FG={fg_pixels:,}, Unknown={unknown_pixels:,}, BG={bg_pixels:,}"
+        )
+        self.logger.info(f"ADAPTIVE: Avg erosion={avg_erosion:.1f}px, Avg dilation={avg_dilation:.1f}px")
+
+        return trimap
+
     def _adaptive_trimap(
         self,
         mask_binary: np.ndarray,
@@ -462,114 +667,25 @@ class TrimapSynthesizer:
 
         h, w = mask_binary.shape
 
-        # =====================================================================
-        # STEP 1: COMPUTE COMPLEXITY MAP (Depth + RGB Gradient Magnitude)
-        # =====================================================================
-        # complexity: 0.0 (smooth like shoulders) to 1.0 (messy like hair)
-        depth_complexity = self._compute_complexity_map(depth)
-        
-        # Add RGB guidance if available
-        if rgb is not None and self.config.rgb_complexity_weight > 0:
-            rgb_complexity = self._compute_rgb_complexity(rgb)
-            # Resize if needed (handling potential mismatches)
-            if rgb_complexity.shape != depth_complexity.shape:
-                rgb_complexity = cv2.resize(rgb_complexity, (w, h))
-            
-            # Combine: MAX(depth, rgb) ensures we capture edges from either source
-            # We scale RGB contribution by weight
-            complexity_map = np.maximum(depth_complexity, rgb_complexity * self.config.rgb_complexity_weight)
-        else:
-            complexity_map = depth_complexity
+        # Step 1: Compute complexity map from depth and optionally RGB
+        complexity_map = self._compute_combined_complexity(depth, rgb, h, w)
 
-        # =====================================================================
-        # STEP 2: COMPUTE MOTION FACTOR (Optional)
-        # =====================================================================
-        motion_factor = np.zeros((h, w), dtype=np.float32)
-        if self.config.motion_aware and prev_frame_gray is not None and curr_frame_gray is not None:
-            motion_factor = self._compute_motion_factor(prev_frame_gray, curr_frame_gray)
+        # Step 2: Compute motion factor (optional)
+        motion_factor = self._compute_optional_motion_factor(h, w, prev_frame_gray, curr_frame_gray)
 
-        # =====================================================================
-        # STEP 3: DISTANCE TRANSFORMS (Both directions)
-        # =====================================================================
-        mask_255 = (mask_binary * 255).astype(np.uint8)
+        # Step 3: Compute distance transforms
+        dist_inside, dist_outside = self._compute_distance_transforms(mask_binary)
 
-        # dist_inside: Distance from edge to center (for EROSION)
-        dist_inside = cv2.distanceTransform(mask_255, cv2.DIST_L2, 5)
-
-        # dist_outside: Distance from edge to background (for DILATION)
-        inv_mask = cv2.bitwise_not(mask_255)
-        dist_outside = cv2.distanceTransform(inv_mask, cv2.DIST_L2, 5)
-
-        # =====================================================================
-        # STEP 4: FORMULAIC EROSION (The "Smart Core")
-        # =====================================================================
-        # Base + Max (configurable) for deeper hair retreat
-        erosion_threshold = (
-            self.config.erosion_base_px +
-            (self.config.erosion_max_px * complexity_map)
+        # Step 4 & 5: Compute adaptive thresholds
+        erosion_threshold, dilation_threshold = self._compute_adaptive_thresholds(
+            complexity_map, motion_factor
         )
 
-        # Create the Dynamic Core
-        # A pixel is core ONLY if it is deep enough inside (beyond erosion threshold)
-        core_mask = (dist_inside > erosion_threshold).astype(np.uint8) * 255
-
-        self.logger.debug(
-            f"ADAPTIVE: Erosion threshold range: {erosion_threshold.min():.1f}px - {erosion_threshold.max():.1f}px"
+        # Step 6: Assemble trimap
+        return self._assemble_trimap(
+            mask_binary, dist_inside, dist_outside,
+            erosion_threshold, dilation_threshold
         )
-
-        # =====================================================================
-        # STEP 5: FORMULAIC DILATION (The "Dynamic Reach")
-        # =====================================================================
-        # External reach adapts to complexity and motion:
-        # - Smooth regions → base_px reach (e.g., 2px)
-        # - Complex regions → up to max_px reach (e.g., 60px)
-        # - Motion blur areas → additional expansion
-        dilation_threshold = (
-            self.config.adaptive_base_px +
-            (self.config.adaptive_max_px * complexity_map) +
-            (self.config.motion_weight * motion_factor)
-        )
-
-        self.logger.debug(
-            f"ADAPTIVE: Dilation threshold range: {dilation_threshold.min():.1f}px - {dilation_threshold.max():.1f}px"
-        )
-
-        # =====================================================================
-        # STEP 6: THE "NO-GAP" ASSEMBLY
-        # =====================================================================
-        # This guarantees the black line never exists.
-        # Everything within bounds that isn't white must be grey.
-
-        # Step A: Define the Outer Limit (Everything that ISN'T background)
-        # Valid if inside the mask OR within dynamic reach outside
-        is_potentially_foreground = (mask_binary > 0) | (dist_outside < dilation_threshold)
-
-        # Step B: Build Trimap
-        trimap = np.zeros((h, w), dtype=np.uint8)
-
-        # Fill the WHOLE potential area with Grey first
-        trimap[is_potentially_foreground] = 128
-
-        # Stamp the Smart Core on top (White)
-        trimap[core_mask == 255] = 255
-
-        # Stats
-        fg_pixels = np.sum(trimap == 255)
-        unknown_pixels = np.sum(trimap == 128)
-        bg_pixels = np.sum(trimap == 0)
-
-        # Compute average widths for logging
-        outer_zone = (dist_outside > 0) & (dist_outside < dilation_threshold)
-        avg_dilation = np.mean(dilation_threshold[outer_zone]) if np.any(outer_zone) else 0
-        inner_zone = (dist_inside > 0) & (dist_inside <= erosion_threshold)
-        avg_erosion = np.mean(erosion_threshold[inner_zone]) if np.any(inner_zone) else 0
-
-        self.logger.info(
-            f"ADAPTIVE Trimap: FG={fg_pixels:,}, Unknown={unknown_pixels:,}, BG={bg_pixels:,}"
-        )
-        self.logger.info(f"ADAPTIVE: Avg erosion={avg_erosion:.1f}px, Avg dilation={avg_dilation:.1f}px")
-
-        return trimap
 
     def _simple_edge_trimap(self, mask_binary: np.ndarray) -> np.ndarray:
         """
@@ -777,7 +893,7 @@ class TrimapSynthesizer:
         # Uses local depth complexity for variable unknown width
         # =====================================================================
         if self.config.adaptive_mode:
-            return self._adaptive_trimap(mask_binary, depth, prev_frame_gray, curr_frame_gray)
+            return self._adaptive_trimap(mask_binary, depth, rgb, prev_frame_gray, curr_frame_gray)
 
         # =====================================================================
         # LEGACY MODE: Complex depth analysis (fallback if adaptive disabled)
@@ -1083,15 +1199,31 @@ class ViTMatteRefiner:
 
     def release(self):
         """Release GPU memory."""
-        import torch
+        try:
+            if self.model is not None:
+                del self.model
+                del self.processor
+                self.model = None
+                self.processor = None
 
-        if self.model is not None:
-            del self.model
-            del self.processor
-            self.model = None
-            self.processor = None
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
-        torch.cuda.empty_cache()
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
 
 
 # ==============================================================================
@@ -1227,6 +1359,19 @@ class GeometricMatteRefiner:
     def release(self):
         """Release GPU memory."""
         self.vitmatte.release()
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
 
 
 # ==============================================================================

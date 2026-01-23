@@ -131,13 +131,13 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
         },
         'high': {
             'sam_model': 'large',
-            'depth_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 7,
             'edge_softness': 1.5,
         },
         'ultra': {
             'sam_model': 'large',
-            'depth_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 9,
             'edge_softness': 2.0,
         }
@@ -409,6 +409,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Edge refinement failed, continuing with previous output")
             edge_output = vitmatte_output
+
+        clear_gpu_memory()  # Clean up after Edge Refinement
     else:
         logger.info("Skipping Edge Refinement (--skip-edge)")
         edge_output = vitmatte_output
@@ -445,6 +447,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Temporal smoothing failed, continuing with previous output")
             temporal_output = edge_output
+
+        clear_gpu_memory()  # Clean up after Temporal Smoothing
     else:
         logger.info("Skipping Temporal Smoothing (--skip-temporal)")
         temporal_output = edge_output
@@ -481,6 +485,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Matte combination failed, using previous output")
             combine_output = temporal_output
+
+        clear_gpu_memory()  # Clean up after Matte Combination
     else:
         logger.info("Skipping Matte Combination (--skip-combine)")
         combine_output = temporal_output
@@ -661,8 +667,8 @@ QUALITY PRESETS:
                        choices=["tiny", "small", "base_plus", "large"],
                        help="Override SAM2 model size")
     parser.add_argument("--depth-model",
-                       choices=["small", "base", "large"],
-                       help="Override Depth model size")
+                       choices=["small", "base", "large", "nested-base", "nested-large"],
+                       help="Override Depth model (nested-large best for hair detail)")
 
     # ViTMatte settings (adaptive trimap)
     parser.add_argument("--vitmatte-motion", action="store_true",
