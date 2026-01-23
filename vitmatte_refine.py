@@ -1169,6 +1169,34 @@ class GeometricMatteRefiner:
                     radius=2,
                     eps=1e-6
                 )
+
+                # =====================================================================
+                # STAGE 3.5: HAIR DENSITY & POLISH (The "VFX Look")
+                # =====================================================================
+                # Only apply this to the "Unknown" region (hair/edges)
+                detail_region = (trimap == 128)
+
+                if np.any(detail_region):
+                    # 1. Extract the detail alpha
+                    hair_alpha = alpha_refined[detail_region]
+
+                    # 2. GAMMA BOOST (Thickens the strands)
+                    # Standard "Hair Gamma" is 0.7 - 0.8
+                    # Lower number = Thicker hair
+                    hair_gamma = 0.75
+                    hair_alpha = np.power(hair_alpha, hair_gamma)
+
+                    # 3. BLACK POINT CRUSH (Cleans the "fizz")
+                    # Removes faint noise (< 5% opacity) that causes halos
+                    hair_alpha = np.maximum(0, hair_alpha - 0.02)
+
+                    # 4. GAIN (Solidifies the mass)
+                    # Pushes 80% opacity to 100%
+                    hair_alpha = hair_alpha * 1.1
+
+                    # Write back
+                    alpha_refined[detail_region] = hair_alpha
+
                 alpha = np.clip(alpha_refined, 0, 1).astype(np.float32)
                 self.logger.debug("Applied Guided Filter refinement")
             except ImportError:
