@@ -486,36 +486,53 @@ def run_pipeline(config: PipelineConfig):
         combine_output = temporal_output
 
     # =========================================================================
-    # STAGE 7: Hair Refinement (Optional)
+    # STAGE 7: Hair Refinement (Using Adaptive ViTMatte)
     # =========================================================================
     if not config.skip_hair:
-        hair_script = find_script("hair_refine.py")
+        # POINT TO THE NEW SCRIPT
+        hair_script = find_script("vitmatte_refine.py")
 
-        # Determine alpha source
-        alpha_source = combine_output / "alpha"
-        if not alpha_source.exists():
-            alpha_source = combine_output
+        # Determine inputs
+        # 1. We need the original SAM mask (best source for core)
+        sam_alpha = sam_output / "alpha"
+        if not sam_alpha.exists():
+            # Fallback to whatever alpha we have currently
+            sam_alpha = alpha_source
+
+        # 2. We need depth maps
+        depth_maps = depth_output / "depth"
+        if not depth_maps.exists():
+            logger.warning("No depth maps found for hair refinement!")
+            # In a real fix, you might want to skip or fail here
 
         hair_output = output_dir / "07_hair_output"
 
+        # USE THE NEW ARGUMENTS
         hair_args = [
-            "--alpha", str(alpha_source),
+            "--sam-mask", str(sam_alpha),
+            "--depth", str(depth_maps),
+            "--frames", config.input_path,
             "--output", str(hair_output),
-            "--video", config.input_path if Path(config.input_path).is_file() else "",
-            "--frames", config.input_path if Path(config.input_path).is_dir() else "",
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
+            "--adaptive-base", "2.0",
+            "--adaptive-max", "60.0",
+            "--motion-aware", # Enable the motion logic
+            "--save-trimap",
         ]
 
-        # Only run if we have either video or frames
-        if any(hair_args[-4:]):
-            success = run_python_stage(
-                hair_script, hair_args,
-                "Hair Refinement", config.verbose
-            )
+        # Only run if we have frames (vitmatte needs frames folder, not video file)
+        # Note: If input is a video file, you might need to point to the
+        # temp frames extracted in Stage 1/2 if they exist, or extract them.
+        # Assuming input_path is a sequence or we have temp frames:
 
-            if success:
-                combine_output = hair_output
+        success = run_python_stage(
+            hair_script, hair_args,
+            "Hair Refinement (Adaptive)", config.verbose
+        )
+
+        if success:
+            combine_output = hair_output
 
         clear_gpu_memory()
     else:
