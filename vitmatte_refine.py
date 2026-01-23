@@ -893,7 +893,7 @@ class TrimapSynthesizer:
         # Uses local depth complexity for variable unknown width
         # =====================================================================
         if self.config.adaptive_mode:
-            return self._adaptive_trimap(mask_binary, depth, prev_frame_gray, curr_frame_gray)
+            return self._adaptive_trimap(mask_binary, depth, rgb, prev_frame_gray, curr_frame_gray)
 
         # =====================================================================
         # LEGACY MODE: Complex depth analysis (fallback if adaptive disabled)

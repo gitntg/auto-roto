@@ -131,13 +131,13 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
         },
         'high': {
             'sam_model': 'large',
-            'depth_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 7,
             'edge_softness': 1.5,
         },
         'ultra': {
             'sam_model': 'large',
-            'depth_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 9,
             'edge_softness': 2.0,
         }
@@ -667,8 +667,8 @@ QUALITY PRESETS:
                        choices=["tiny", "small", "base_plus", "large"],
                        help="Override SAM2 model size")
     parser.add_argument("--depth-model",
-                       choices=["small", "base", "large"],
-                       help="Override Depth model size")
+                       choices=["small", "base", "large", "nested-base", "nested-large"],
+                       help="Override Depth model (nested-large best for hair detail)")
 
     # ViTMatte settings (adaptive trimap)
     parser.add_argument("--vitmatte-motion", action="store_true",

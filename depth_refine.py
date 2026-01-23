@@ -64,7 +64,7 @@ class DepthRefineConfig:
     output_dir: str = "./refined"
     
     # Depth model settings
-    depth_model: str = "nested-large"    # small, base, large, nested-base, nested-large
+    depth_model: str = "large"    # large (DA3Mono) best for hair detail; nested smooths fine detail
     compute_depth: bool = True    # Compute depth if not provided
     save_depth: bool = True       # Save depth maps for reuse
     
@@ -231,10 +231,84 @@ class DepthEstimator:
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Normalize to 0-1
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        # Normalize to 0-1 using percentiles to avoid outlier sensitivity
+        p_low, p_high = np.percentile(depth, [2, 98])
+        depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
 
         return depth.astype(np.float32)
+
+    def normalize_for_foreground(
+        self,
+        depth: np.ndarray,
+        mask: np.ndarray,
+        foreground_range: tuple = (0.0, 0.6)
+    ) -> np.ndarray:
+        """
+        Re-normalize depth to expand foreground detail.
+
+        Standard depth normalization compresses the foreground (close objects)
+        into a narrow range. This method expands the foreground region to use
+        more of the 0-1 range, preserving fine detail like hair.
+
+        Args:
+            depth: Depth map (H, W), already normalized 0-1
+            mask: Alpha mask (H, W) where foreground > 0.5
+            foreground_range: Target range for foreground depths (default 0-0.6)
+
+        Returns:
+            Re-normalized depth map with expanded foreground detail
+        """
+        import cv2
+
+        # Get foreground pixels
+        fg_mask = mask > 0.5
+        if not np.any(fg_mask):
+            return depth
+
+        fg_depths = depth[fg_mask]
+
+        # Find foreground depth range (use percentiles for robustness)
+        fg_min = np.percentile(fg_depths, 5)
+        fg_max = np.percentile(fg_depths, 95)
+        fg_range = fg_max - fg_min
+
+        if fg_range < 0.01:
+            # Foreground has no depth variation, can't enhance
+            return depth
+
+        # Target range for foreground
+        target_min, target_max = foreground_range
+        target_range = target_max - target_min
+
+        # Create enhanced depth
+        enhanced = depth.copy()
+
+        # Scale foreground depths to target range
+        # fg_depths: [fg_min, fg_max] -> [target_min, target_max]
+        scale = target_range / fg_range
+        enhanced = (depth - fg_min) * scale + target_min
+
+        # Background depths (> fg_max) get compressed into remaining range
+        bg_mask = depth > fg_max
+        if np.any(bg_mask):
+            bg_depths = depth[bg_mask]
+            bg_min_orig = fg_max
+            bg_max_orig = depth.max()
+            bg_range_orig = bg_max_orig - bg_min_orig + 1e-8
+
+            # Map background to [target_max, 1.0]
+            bg_scale = (1.0 - target_max) / bg_range_orig
+            enhanced[bg_mask] = (depth[bg_mask] - bg_min_orig) * bg_scale + target_max
+
+        # Clip to valid range
+        enhanced = np.clip(enhanced, 0, 1)
+
+        self.logger.debug(
+            f"Foreground depth enhancement: [{fg_min:.3f}, {fg_max:.3f}] -> "
+            f"[{target_min:.3f}, {target_max:.3f}], scale={scale:.2f}x"
+        )
+
+        return enhanced.astype(np.float32)
     
     def estimate_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
         """Estimate depth for a batch of images."""
@@ -294,7 +368,7 @@ class DepthEstimator:
             image: RGB image (H, W, 3), uint8
             tile_size: Size of each tile for non-nested models (default 1024)
             overlap: Overlap between tiles for blending (default 256)
-            mask: Optional alpha mask - only process tiles overlapping mask edges
+            mask: Optional alpha mask - prioritize tiles overlapping mask edges
 
         Returns:
             High-resolution depth map (H, W), float32, normalized 0-1
@@ -326,25 +400,16 @@ class DepthEstimator:
         # Create weight mask for blending (feathered edges)
         def create_weight_mask(th, tw):
             """Create a weight mask with feathered edges for blending."""
-            mask = np.ones((th, tw), dtype=np.float32)
+            mask_w = np.ones((th, tw), dtype=np.float32)
             feather = min(overlap // 2, th // 4, tw // 4)
             if feather > 0:
                 for i in range(feather):
                     weight = (i + 1) / feather
-                    mask[i, :] *= weight
-                    mask[-(i+1), :] *= weight
-                    mask[:, i] *= weight
-                    mask[:, -(i+1)] *= weight
-            return mask
-
-        # If mask provided, find regions of interest (mask edges)
-        if mask is not None:
-            # Dilate mask to get region around edges
-            mask_binary = (mask > 0.1).astype(np.uint8)
-            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (100, 100))
-            mask_dilated = cv2.dilate(mask_binary, dilate_kernel, iterations=1)
-        else:
-            mask_dilated = np.ones((h, w), dtype=np.uint8)
+                    mask_w[i, :] *= weight
+                    mask_w[-(i+1), :] *= weight
+                    mask_w[:, i] *= weight
+                    mask_w[:, -(i+1)] *= weight
+            return mask_w
 
         # Calculate tile grid
         step = tile_size - overlap
@@ -355,12 +420,6 @@ class DepthEstimator:
                 # Tile boundaries
                 y1, y2 = y, min(y + tile_size, h)
                 x1, x2 = x, min(x + tile_size, w)
-
-                # Check if this tile overlaps with mask region
-                if mask is not None:
-                    tile_mask = mask_dilated[y1:y2, x1:x2]
-                    if np.sum(tile_mask) < 100:  # Skip tiles with no mask overlap
-                        continue
 
                 # Extract tile
                 tile = image[y1:y2, x1:x2]
@@ -1500,6 +1559,12 @@ class DepthRefinePipeline:
                         mask=alpha  # Only process tiles near the subject (for tiled models)
                     )
 
+                    # Enhance foreground depth detail using mask
+                    # This expands the depth range within the subject for better hair/detail detection
+                    depth = self.depth_estimator.normalize_for_foreground(
+                        depth, alpha, foreground_range=(0.0, 0.7)
+                    )
+
                     if self.config.save_depth:
                         # Save float EXR for actual depth data (for reuse/processing)
                         depth_float_path = depth_dir / f"depth.{idx:04d}.exr"
@@ -1661,9 +1726,9 @@ EXAMPLES:
                        help="Output directory")
     
     # Depth model
-    parser.add_argument("--depth-model", default="nested-large",
+    parser.add_argument("--depth-model", default="large",
                        choices=["small", "base", "large", "nested-base", "nested-large"],
-                       help="Depth Anything 3 model (nested-large recommended for best quality)")
+                       help="Depth Anything 3 model (large=DA3Mono best for hair detail)")
     parser.add_argument("--no-save-depth", action="store_true",
                        help="Don't save computed depth maps")
     
