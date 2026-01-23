@@ -1,0 +1,244 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "context_version": "1.0.0",
+  "project_name": "AUTO-ROTO",
+  "project_version": "5.0.0",
+  "context_fingerprint": "auto_roto_v5_20260122_alpha_quality",
+  "captured_at": "2026-01-22T15:45:00Z",
+  "branch": "feature/alpha-quality-v5",
+
+  "project_overview": {
+    "description": "Production-grade automatic rotoscoping pipeline using SAM2, GroundingDINO, and Depth Anything V2",
+    "purpose": "Generate professional-quality alpha mattes from video clips for VFX compositing",
+    "target_users": ["VFX Artists", "Compositors", "Motion Graphics Designers"],
+    "primary_output": "16-bit EXR alpha sequences for Nuke/After Effects"
+  },
+
+  "v5_enhancements": {
+    "summary": "Professional VFX quality modules implementing industry-standard compositing techniques",
+    "new_modules": [
+      {
+        "name": "edge_refine.py",
+        "lines": 830,
+        "purpose": "Professional edge refinement with subpixel precision",
+        "key_features": [
+          "Subpixel edge detection using Laplacian-of-Gaussian at 4x resolution",
+          "Color difference keying (Primatte/Keylight-style edge sampling)",
+          "Morphological gradient for precise edge band extraction",
+          "Premultiplied alpha operations for proper compositing math",
+          "Anti-aliasing with configurable strength",
+          "Soft falloff generation with gamma curves",
+          "Core shrink and edge extend operations",
+          "Despill with complementary color suppression"
+        ],
+        "main_classes": [
+          "SubpixelEdgeDetector",
+          "ColorDifferenceKeyer",
+          "MorphologicalGradient",
+          "PremultipliedAlpha",
+          "SoftEdgeGenerator",
+          "EdgeRefiner",
+          "EdgeRefinePipeline"
+        ]
+      },
+      {
+        "name": "temporal_smooth.py",
+        "lines": 970,
+        "purpose": "Frame-to-frame coherence to prevent flickering",
+        "key_features": [
+          "Optical flow estimation using Farneback algorithm",
+          "Motion-compensated temporal median filtering",
+          "Edge confidence tracking across frames",
+          "Keyframe anchoring to prevent long-term drift",
+          "Anti-flicker processing with max delta limiting",
+          "Streaming processor for memory efficiency"
+        ],
+        "main_classes": [
+          "OpticalFlowEstimator",
+          "TemporalMedianFilter",
+          "EdgeConfidenceTracker",
+          "KeyframeAnchor",
+          "AntiFlicker",
+          "TemporalSmoother",
+          "StreamingTemporalProcessor",
+          "TemporalSmoothPipeline"
+        ]
+      },
+      {
+        "name": "matte_combine.py",
+        "lines": 1000,
+        "purpose": "Multi-layer matte architecture and professional compositing",
+        "key_features": [
+          "Core/Detail/Soft Edge layer separation",
+          "Professional blend modes (over, under, max, min, screen, multiply, etc.)",
+          "Despill with auto-detected background color",
+          "Light wrap simulation for natural composites",
+          "Edge color correction",
+          "Holdout matte support with union/intersect/subtract",
+          "Proper OVER operation with premultiplied alpha"
+        ],
+        "main_classes": [
+          "CoreMatte",
+          "DetailMatte",
+          "SoftEdgeMatte",
+          "MatteBlender",
+          "Despill",
+          "LightWrap",
+          "EdgeColorCorrection",
+          "HoldoutMatte",
+          "MatteCombiner",
+          "MatteCombinePipeline"
+        ]
+      },
+      {
+        "name": "full_pipeline_v5.py",
+        "lines": 480,
+        "purpose": "Integrated pipeline chaining all v5 stages",
+        "key_features": [
+          "Quality presets (draft/standard/high/ultra)",
+          "Stage skip flags for flexibility",
+          "Automatic intermediate cleanup",
+          "Verbose mode with timing",
+          "Keep intermediate files option"
+        ],
+        "pipeline_stages": [
+          "SAM2 Segmentation (auto_roto.py)",
+          "Depth Refinement (depth_refine.py)",
+          "Edge Refinement (edge_refine.py)",
+          "Temporal Smoothing (temporal_smooth.py)",
+          "Matte Combination (matte_combine.py)",
+          "Hair Refinement (hair_refine.py) - optional"
+        ]
+      }
+    ]
+  },
+
+  "quality_presets": {
+    "draft": {
+      "sam_model": "tiny",
+      "depth_model": "small",
+      "temporal_window": 3,
+      "edge_softness": 0.5,
+      "use_case": "Quick preview"
+    },
+    "standard": {
+      "sam_model": "base_plus",
+      "depth_model": "base",
+      "temporal_window": 5,
+      "edge_softness": 1.0,
+      "use_case": "Production default"
+    },
+    "high": {
+      "sam_model": "large",
+      "depth_model": "large",
+      "temporal_window": 7,
+      "edge_softness": 1.5,
+      "use_case": "Hero shots"
+    },
+    "ultra": {
+      "sam_model": "large",
+      "depth_model": "large",
+      "temporal_window": 9,
+      "edge_softness": 2.0,
+      "use_case": "Maximum quality"
+    }
+  },
+
+  "architectural_decisions": [
+    {
+      "decision_type": "multi_layer_matte_architecture",
+      "rationale": "Professional compositing separates core (solid interior), detail (hair/transparency), and soft edge (anti-aliased boundary) for independent control",
+      "impact_score": 9,
+      "alternatives_considered": ["Single-pass refinement", "Simple blur-based softening"],
+      "chosen_because": "Matches industry-standard Nuke/Flame workflows"
+    },
+    {
+      "decision_type": "temporal_optical_flow",
+      "rationale": "Motion-compensated filtering prevents edge flickering while preserving motion detail",
+      "impact_score": 8,
+      "alternatives_considered": ["Simple frame averaging", "3D convolution"],
+      "chosen_because": "Farneback flow is fast and provides per-pixel motion vectors"
+    },
+    {
+      "decision_type": "subpixel_edge_detection",
+      "rationale": "4x upscaling with LoG detection provides anti-aliased edges without artifacts",
+      "impact_score": 7,
+      "alternatives_considered": ["Standard Sobel/Canny", "Neural edge detection"],
+      "chosen_because": "Balanced quality vs compute, works on any GPU"
+    },
+    {
+      "decision_type": "premultiplied_alpha",
+      "rationale": "Industry standard for compositing - preserves edge color, enables proper over/screen operations",
+      "impact_score": 9,
+      "alternatives_considered": ["Straight alpha"],
+      "chosen_because": "Required for professional VFX pipelines"
+    },
+    {
+      "decision_type": "color_difference_keying",
+      "rationale": "Sampling FG/BG colors at edge bands allows refined alpha calculation based on color proximity",
+      "impact_score": 8,
+      "alternatives_considered": ["Depth-only refinement", "ML-based matting"],
+      "chosen_because": "Works well for varied content, no additional model required"
+    }
+  ],
+
+  "current_test_sequence": {
+    "name": "CarCrash",
+    "path": "/mnt/f/3DActive/CarCrash/reel-new/renders/scene-01nfp",
+    "frame_range": "125344-125603",
+    "total_frames": 262,
+    "file_pattern": "denoised-floatingCarCrash_######.png",
+    "file_size": "~31MB per frame (denoised PNG)",
+    "notes": "Denoised PNG sequence ready for rotoscoping"
+  },
+
+  "usage_examples": {
+    "basic_v5": "python full_pipeline_v5.py --input video.mp4 --prompt \"person\" --output ./output",
+    "high_quality": "python full_pipeline_v5.py --input video.mp4 --prompt \"person\" --output ./output --quality high",
+    "carcrash_sequence": "python full_pipeline_v5.py --input \"/mnt/f/3DActive/CarCrash/reel-new/renders/scene-01nfp\" --prompt \"car\" --output ./carcrash_v5 --quality high --verbose",
+    "skip_temporal": "python full_pipeline_v5.py --input video.mp4 --prompt \"person\" --output ./output --skip-temporal",
+    "custom_edge": "python full_pipeline_v5.py --input video.mp4 --prompt \"person\" --output ./output --edge-softness 1.5 --core-shrink 5 --despill 0.7"
+  },
+
+  "dependencies": {
+    "python": "3.10+",
+    "pytorch": "2.5+",
+    "sam2": "SAM 2.1 from facebookresearch",
+    "groundingdino": "v0.1.0-alpha for text prompts",
+    "depth_anything_v2": "For depth-guided refinement",
+    "opencv": "4.8+ with contrib for guidedFilter",
+    "numpy": "1.24+",
+    "openexr": "3.2+ for 16-bit EXR output"
+  },
+
+  "git_state": {
+    "branch": "feature/alpha-quality-v5",
+    "commits": [
+      {
+        "hash": "827608a",
+        "message": "docs: Add v5 pipeline documentation to README"
+      },
+      {
+        "hash": "249798c",
+        "message": "feat: Add professional VFX quality modules for v5 pipeline"
+      },
+      {
+        "hash": "069b29a",
+        "message": "Initial commit: Auto-Roto pipeline"
+      }
+    ]
+  },
+
+  "next_steps": [
+    "User needs to activate conda/autoroto environment with PyTorch installed",
+    "Run v5 pipeline on CarCrash sequence to validate",
+    "Tune edge_softness and despill parameters for specific footage",
+    "Consider enabling hair refinement (--with-hair) if subjects have hair"
+  ],
+
+  "known_issues": [
+    "Virtual environment autoroto_env exists but lacks PyTorch - needs conda env instead",
+    "Pyright warnings about missing imports are expected (runtime deps installed in env)",
+    "Large sequences may need --skip-temporal for faster processing"
+  ]
+}

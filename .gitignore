@@ -81,6 +81,17 @@ weights/
 *_roto/
 *_refined/
 *_depth_refined*/
+test_output*/
+test_input/
+
+# Comparison/debug images
+comparison_*.jpg
+comparison_*.png
+*_preview.png
+zoom_*.jpg
+
+# Pip artifacts
+=*
 
 # Claude context files
 .claude-context.json
