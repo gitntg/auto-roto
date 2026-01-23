@@ -457,24 +457,182 @@ class DepthGuidedRefiner:
         self.min_hair_alpha = min_hair_alpha
         self.logger = logger or logging.getLogger("DepthRefiner")
     
+    def detect_hair_region(self, alpha: np.ndarray, extended: bool = False) -> np.ndarray:
+        """
+        Detect the hair region (top portion of mask where head is).
+
+        Args:
+            alpha: Alpha mask
+            extended: If True, use larger region (60% height) with more dilation
+
+        Returns a mask focused on where hair is likely to be.
+        """
+        import cv2
+
+        mask_binary = (alpha > 0.5).astype(np.uint8)
+
+        # Find contours to locate the main subject
+        contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if not contours:
+            return np.zeros_like(alpha)
+
+        # Get bounding box of largest contour
+        largest = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(largest)
+
+        # Hair region - use more of the bounding box if extended
+        hair_region = np.zeros_like(alpha)
+        hair_percent = 0.6 if extended else 0.4
+        hair_height = int(h * hair_percent)
+
+        # Also extend above the bounding box (hair may extend upward)
+        y_start = max(0, y - int(h * 0.1))
+        hair_region[y_start:y+hair_height, x:x+w] = 1.0
+
+        # Dilate to include area around hair - larger if extended
+        dilate_size = self.hair_search_radius * (3 if extended else 2)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+        hair_region = cv2.dilate(hair_region.astype(np.uint8), dilate_kernel).astype(np.float32)
+
+        return hair_region
+
+    def detect_hair_texture(self, rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        """
+        Detect hair-like texture using high-frequency analysis.
+
+        Hair has characteristic fine texture patterns that differ from
+        smooth surfaces. We use Laplacian to detect this.
+
+        Args:
+            rgb: RGB image (H, W, 3), uint8 or float
+            alpha: Current alpha mask
+
+        Returns:
+            Hair texture confidence map (H, W), float32 0-1
+        """
+        import cv2
+
+        # Convert to grayscale
+        if rgb.max() > 1:
+            gray = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        else:
+            gray = cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+        # Compute Laplacian (high-frequency detector)
+        laplacian = cv2.Laplacian(gray, cv2.CV_32F, ksize=3)
+        texture_energy = np.abs(laplacian)
+
+        # Get texture energy stats from inside mask (foreground reference)
+        mask_binary = alpha > 0.5
+        if np.sum(mask_binary) > 100:
+            fg_texture_mean = np.mean(texture_energy[mask_binary])
+            fg_texture_std = np.std(texture_energy[mask_binary])
+        else:
+            fg_texture_mean = 0.05
+            fg_texture_std = 0.02
+
+        # Hair has higher texture energy than smooth surfaces
+        # Pixels with texture similar to foreground are candidates
+        texture_threshold = max(fg_texture_mean - fg_texture_std, 0.01)
+        hair_texture = (texture_energy > texture_threshold).astype(np.float32)
+
+        # Weight by texture energy (more texture = more likely hair)
+        hair_confidence = np.clip(texture_energy / (fg_texture_mean + 0.01), 0, 1)
+
+        return hair_confidence * hair_texture
+
+    def detect_hair_color(
+        self,
+        rgb: np.ndarray,
+        alpha: np.ndarray,
+        depth: np.ndarray,
+        fg_depth_min: float,
+        fg_depth_max: float,
+        foreground_threshold: float
+    ) -> np.ndarray:
+        """
+        Detect hair by color similarity to foreground.
+
+        Sample hair color from inside the mask (top region), then find
+        similar colors outside the mask that also have foreground depth.
+
+        Args:
+            rgb: RGB image
+            alpha: Current alpha mask
+            depth: Float depth map (0-1)
+            fg_depth_min: Minimum foreground depth (furthest fg)
+            fg_depth_max: Maximum foreground depth (closest fg, likely hair)
+            foreground_threshold: Depth threshold separating fg from bg
+
+        Returns:
+            Hair color confidence map (H, W), float32 0-1
+        """
+        import cv2
+
+        if rgb.max() > 1:
+            rgb_float = rgb.astype(np.float32) / 255.0
+        else:
+            rgb_float = rgb.astype(np.float32)
+
+        # Get hair region (top of mask)
+        hair_sample_region = self.detect_hair_region(alpha)
+        hair_sample_region = hair_sample_region * (alpha > 0.5).astype(np.float32)
+
+        if np.sum(hair_sample_region > 0.5) < 100:
+            return np.zeros_like(alpha)
+
+        # Sample hair color from the hair region
+        hair_pixels = rgb_float[hair_sample_region > 0.5]
+        hair_color_mean = np.mean(hair_pixels, axis=0)
+        hair_color_std = np.std(hair_pixels, axis=0) + 0.05
+
+        # Compute color distance from hair color
+        color_diff = np.sqrt(np.sum((rgb_float - hair_color_mean) ** 2, axis=2))
+        color_tolerance = np.sqrt(np.sum(hair_color_std ** 2))
+
+        # Color similarity (Gaussian falloff)
+        color_similarity = np.exp(-(color_diff ** 2) / (2 * (color_tolerance ** 2)))
+
+        # RANGE-BASED depth gating - hair can be CLOSER than body
+        # Accept any depth in foreground range or closer
+        depth_ok = depth > foreground_threshold
+
+        # Extra boost for pixels at hair-like depth (very close to camera)
+        # Hair is typically the closest thing (highest depth value)
+        hair_depth_boost = np.where(
+            depth > fg_depth_max - 0.05,  # very close to camera
+            1.5,  # boost
+            1.0
+        )
+
+        # Combine: similar color AND foreground depth
+        hair_color_confidence = color_similarity * depth_ok.astype(np.float32) * hair_depth_boost
+
+        return np.clip(hair_color_confidence, 0, 1).astype(np.float32)
+
     def compute_depth_edges(self, depth: np.ndarray) -> np.ndarray:
         """
         Compute depth edge map (magnitude of depth gradient).
-        
+
+        Uses FLOAT depth values directly for precision.
         Higher values = stronger depth discontinuity = likely object edge
         """
         import cv2
-        
-        # Compute gradients
-        grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
-        
+
+        # Ensure we're working with float depth (not colorized)
+        depth_float = depth.astype(np.float32)
+
+        # Compute gradients on float depth
+        grad_x = cv2.Sobel(depth_float, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(depth_float, cv2.CV_32F, 0, 1, ksize=3)
+
         # Magnitude
         edge_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
+
         # Normalize
         edge_magnitude = edge_magnitude / (edge_magnitude.max() + 1e-8)
-        
+
         return edge_magnitude
     
     def compute_alpha_edges(self, alpha: np.ndarray) -> np.ndarray:
@@ -496,30 +654,29 @@ class DepthGuidedRefiner:
         rgb: np.ndarray = None
     ) -> np.ndarray:
         """
-        Refine alpha matte using PROFESSIONAL KEYING WORKFLOW.
+        Refine alpha matte using PROFESSIONAL KEYING WORKFLOW with FLOAT DEPTH.
 
         This follows the industry-standard multi-matte approach:
 
         Stage 1 - CORE MATTE (Inner Key):
             Eroded SAM2 mask → 100% solid, never touches edges
-            Prevents "crunchy" artifacts at boundaries
 
-        Stage 2 - EDGE MATTE (Detail Key):
-            Depth-based detection → captures hair/fine detail
-            Interior has holes - that's intentional!
-            Preserves every pixel of delicate edges
+        Stage 2 - DEPTH-GATED EDGE MATTE:
+            Uses FLOAT depth values for precise foreground/background separation
+            Only pixels with matching foreground depth are considered
 
-        Stage 3 - COMBINE (Matte Logic):
-            MAX(core, edge) → core provides solid, edge provides detail
-            Like Nuke's Keymix or Max operation
+        Stage 3 - HAIR-SPECIFIC DETECTION (NEW):
+            Texture analysis for fine hair strands
+            Color matching for hair color continuity
+            Focused on hair region (top of subject)
 
-        Stage 4 - ADDITIVE (Color Difference Key):
-            Luminance-based recovery for missed transparency
+        Stage 4 - COMBINE (Matte Logic):
+            MAX(core, edge, hair) with proper weighting
 
         Args:
             alpha: Alpha matte (H, W), values 0-1
-            depth: Depth map (H, W), values 0-1
-            rgb: Optional RGB image for additive key
+            depth: FLOAT depth map (H, W), values 0-1 (NOT colorized!)
+            rgb: Optional RGB image for hair detection
 
         Returns:
             Combined alpha matte (H, W), values 0-1
@@ -527,20 +684,21 @@ class DepthGuidedRefiner:
         import cv2
 
         alpha = alpha.astype(np.float32)
+        # CRITICAL: Ensure depth is float, not colorized values
         depth = depth.astype(np.float32)
+        if depth.max() > 1.0:
+            self.logger.warning("Depth values > 1.0 detected - normalizing. Ensure float depth is used!")
+            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
 
         h, w = alpha.shape
 
         # =====================================================================
         # STAGE 1: CORE MATTE (The Inner Key)
         # =====================================================================
-        # Erode the SAM2 mask to create solid interior that never touches edges
-        # This prevents all edge artifacts - the core is 100% clean
-
         mask_binary = (alpha > 0.5).astype(np.uint8)
 
-        # Significant erosion to stay away from problematic edges
-        core_erode_size = 15  # pixels to erode inward
+        # Smaller erosion to preserve more of SAM2's shape
+        core_erode_size = 8  # reduced from 15
         erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
                                                   (core_erode_size * 2 + 1, core_erode_size * 2 + 1))
         core_matte = cv2.erode(mask_binary, erode_kernel, iterations=1).astype(np.float32)
@@ -548,142 +706,319 @@ class DepthGuidedRefiner:
         self.logger.debug(f"Core matte: {np.sum(core_matte > 0.5)} solid pixels")
 
         # =====================================================================
-        # STAGE 2: EDGE MATTE (The Detail Key)
+        # STAGE 2: FLOAT DEPTH ANALYSIS
         # =====================================================================
-        # Create a separate matte focused ONLY on edge detail
-        # CRITICAL: Must be DEPTH-GATED to exclude background scene elements
-        # Only pixels with FOREGROUND DEPTH should be included
-
-        # Get foreground depth from deep inside the mask
+        # Get foreground depth statistics from deep inside the mask
         dist_inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 5)
-        deep_core = dist_inside > 30  # well inside
+        deep_core = dist_inside > 30
 
         if np.sum(deep_core) > 100:
             fg_depth_median = np.median(depth[deep_core])
             fg_depth_std = np.std(depth[deep_core])
+            # Get full range of foreground depths
+            fg_depth_min = np.percentile(depth[deep_core], 5)   # furthest foreground
+            fg_depth_max = np.percentile(depth[deep_core], 95)  # closest foreground (hair!)
         else:
             fg_depth_median = np.median(depth[alpha > 0.5])
             fg_depth_std = 0.1
+            fg_depth_min = fg_depth_median - 0.15
+            fg_depth_max = fg_depth_median + 0.15
 
-        self.logger.debug(f"Foreground depth: {fg_depth_median:.3f} ± {fg_depth_std:.3f}")
+        # CRITICAL: Get background depth to establish the threshold
+        bg_region = dist_inside == 0  # outside mask
+        if np.sum(bg_region) > 100:
+            bg_depth_median = np.median(depth[bg_region])
+            bg_depth_max = np.percentile(depth[bg_region], 95)  # closest background
+        else:
+            bg_depth_median = 0.2
+            bg_depth_max = 0.3
+
+        self.logger.debug(f"Foreground depth (float): median={fg_depth_median:.4f}, "
+                         f"range=[{fg_depth_min:.4f}, {fg_depth_max:.4f}]")
+        self.logger.debug(f"Background depth (float): median={bg_depth_median:.4f}, max={bg_depth_max:.4f}")
 
         # Distance transforms
         dist_outside = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 5)
 
-        inner_edge_dist = 10   # pixels inside the SAM2 edge
-        outer_edge_dist = float(self.hair_search_radius)  # pixels outside
+        # =====================================================================
+        # STAGE 3: DEPTH-GATED EDGE DETECTION (RANGE-BASED)
+        # =====================================================================
+        inner_edge_dist = 5    # reduced - stay closer to SAM2 edge
+        outer_edge_dist = float(self.hair_search_radius)
 
-        # Spatial edge region (near the mask boundary)
+        # Spatial edge region (tighter around mask boundary)
         spatial_edge_region = (dist_inside <= inner_edge_dist) | (dist_outside <= outer_edge_dist)
 
-        # Compute depth confidence
-        depth_diff = np.abs(depth - fg_depth_median)
-        tolerance = max(self.depth_tolerance, fg_depth_std * 2.5)
+        # CRITICAL FIX: Use RANGE-based depth matching, not single-value matching
+        # Foreground includes EVERYTHING closer than background (hair is CLOSER than body!)
+        #
+        # Depth map: higher value = CLOSER to camera
+        # - Hair: ~0.85-1.0 (closest, brightest in INFERNO)
+        # - Body: ~0.65-0.75 (medium)
+        # - Background: ~0.0-0.4 (furthest, darkest)
+        #
+        # A pixel is foreground if its depth > background_threshold
 
-        # Gaussian falloff for smooth depth confidence
-        depth_confidence = np.exp(-(depth_diff ** 2) / (2 * (tolerance ** 2)))
+        # Compute the separation threshold between foreground and background
+        # CRITICAL: Hair strands outside mask have LOWER depth than solid body inside mask
+        # Hair is typically at 0.4-0.6, background at 0.1-0.3, body at 0.7-0.9
+        #
+        # Use threshold just above background max to capture hair
+        foreground_threshold = bg_depth_max + self.depth_tolerance
 
-        # STRICT DEPTH GATE: Only pixels with foreground-like depth
-        # This is what excludes the background scene!
-        depth_threshold = 0.3  # minimum depth confidence to be considered foreground
-        is_foreground_depth = depth_confidence > depth_threshold
+        # Also compute a hair-specific threshold (lower, to catch more hair)
+        # Hair strands should be above background but may not match body depth
+        hair_foreground_threshold = bg_depth_median + (bg_depth_max - bg_depth_median) * 0.5 + 0.05
 
-        # Edge matte = ONLY pixels that are:
-        # 1. In spatial edge region (near mask boundary)
-        # 2. AND have foreground-like depth (not background)
+        self.logger.debug(f"Foreground threshold: {foreground_threshold:.4f}")
+        self.logger.debug(f"Hair foreground threshold: {hair_foreground_threshold:.4f}")
+
+        # FOREGROUND = anything with depth > threshold (closer to camera)
+        is_foreground_depth = depth > foreground_threshold
+
+        # Compute confidence based on how far above the threshold
+        # Pixels well above threshold get high confidence
+        depth_margin = depth - foreground_threshold
+        depth_confidence = np.clip(depth_margin / (fg_depth_max - foreground_threshold + 0.01), 0, 1)
+
+        # Boost confidence for pixels very close to known foreground depth range
+        in_fg_range = (depth >= fg_depth_min - 0.05) & (depth <= fg_depth_max + 0.1)
+        depth_confidence = np.where(in_fg_range, np.maximum(depth_confidence, 0.8), depth_confidence)
+
+        # Edge matte with strict depth gating
         edge_matte = np.zeros_like(alpha)
         valid_edge = spatial_edge_region & is_foreground_depth
         edge_matte[valid_edge] = depth_confidence[valid_edge]
 
-        # Apply distance-based falloff for pixels OUTSIDE the original mask
+        # Distance-based falloff for outside pixels
         outside_mask = dist_outside > 0
         if np.any(outside_mask & valid_edge):
             distance_falloff = 1.0 - (dist_outside / outer_edge_dist)
             distance_falloff = np.clip(distance_falloff, 0, 1)
-            # Only apply to valid edge pixels
             edge_matte[outside_mask] *= distance_falloff[outside_mask]
 
-        # Scale by blend strength
-        edge_matte = edge_matte * self.blend_strength
+        edge_matte = edge_matte * self.blend_strength * 0.7  # reduced strength
 
-        self.logger.debug(f"Edge matte: {np.sum(edge_matte > 0.1)} detail pixels (depth-gated)")
-
-        # =====================================================================
-        # STAGE 3: COMBINE (Matte Logic - MAX Operation)
-        # =====================================================================
-        # Like Nuke's Max or Keymix: take the higher value at each pixel
-        # Core provides solid interior, Edge provides fine detail
-
-        combined = np.maximum(core_matte, edge_matte)
-
-        # Also incorporate original SAM2 alpha where it's useful
-        # (in case SAM2 captured some edge detail we'd lose)
-        combined = np.maximum(combined, alpha * 0.8)  # slight reduction to prefer our mattes
-
-        self.logger.debug(f"Combined (after MAX): {np.sum(combined > 0.5)} pixels > 0.5")
+        self.logger.debug(f"Edge matte (depth-gated): {np.sum(edge_matte > 0.1)} pixels")
 
         # =====================================================================
-        # STAGE 4: ADDITIVE KEY (Color Difference / Luminance Recovery)
+        # STAGE 4: HAIR-SPECIFIC DETECTION (TEXTURE + COLOR + DEPTH)
         # =====================================================================
-        # Recover fine transparency details using luminance differences
-        # CRITICAL: Must also be DEPTH-GATED to exclude background!
+        hair_matte = np.zeros_like(alpha)
 
         if rgb is not None:
-            # Convert to grayscale for luminance analysis
-            if len(rgb.shape) == 3:
-                if rgb.max() > 1:
-                    rgb_norm = rgb.astype(np.float32) / 255.0
-                else:
-                    rgb_norm = rgb.astype(np.float32)
+            # Get hair region - use EXTENDED region for better coverage
+            hair_region = self.detect_hair_region(alpha, extended=True)
+            hair_region_normal = self.detect_hair_region(alpha, extended=False)
 
-                # Luminance
-                luminance = 0.299 * rgb_norm[:,:,0] + 0.587 * rgb_norm[:,:,1] + 0.114 * rgb_norm[:,:,2]
+            # Texture-based hair detection
+            hair_texture = self.detect_hair_texture(rgb, alpha)
 
-                # Get background luminance (from truly outside region)
-                bg_region = dist_outside > outer_edge_dist
-                if np.sum(bg_region) > 100:
-                    bg_luminance = np.median(luminance[bg_region])
-                else:
-                    bg_luminance = 0.1
+            # Color-based hair detection (depth-gated with RANGE)
+            hair_color = self.detect_hair_color(
+                rgb, alpha, depth,
+                fg_depth_min, fg_depth_max, foreground_threshold
+            )
 
-                # Foreground luminance (from core)
-                if np.sum(deep_core) > 100:
-                    fg_luminance = np.median(luminance[deep_core])
-                else:
-                    fg_luminance = 0.5
+            # =================================================================
+            # METHOD 1: Texture + Color evidence
+            # =================================================================
+            hair_evidence_tc = hair_texture * hair_color * is_foreground_depth.astype(np.float32)
+            hair_evidence_tc = hair_evidence_tc * hair_region_normal * outside_mask.astype(np.float32)
 
-                # Additive key based on luminance difference
-                if fg_luminance > bg_luminance:
-                    lum_diff = luminance - bg_luminance
-                    lum_range = fg_luminance - bg_luminance + 0.01
-                    additive_matte = np.clip(lum_diff / lum_range, 0, 1)
-                else:
-                    lum_diff = bg_luminance - luminance
-                    lum_range = bg_luminance - fg_luminance + 0.01
-                    additive_matte = np.clip(lum_diff / lum_range, 0, 1)
+            # =================================================================
+            # METHOD 2: DIRECT DEPTH-BASED HAIR
+            # The depth map clearly shows hair detail - TRUST IT DIRECTLY!
+            # If a pixel has foreground depth and is in the hair region, it's hair.
+            # =================================================================
 
-                # DEPTH-GATE the additive key: only apply where depth is foreground-like
-                # This prevents background scene elements from being included!
-                additive_matte = additive_matte * is_foreground_depth.astype(np.float32)
+            # Use the LOWER hair-specific threshold - hair strands have lower depth than body
+            # Hair is typically at depth 0.4-0.6, above background (0.1-0.3) but below body (0.7-0.9)
+            hair_depth_threshold = hair_foreground_threshold
 
-                # Also restrict to spatial edge region
-                additive_matte = additive_matte * spatial_edge_region.astype(np.float32)
+            self.logger.debug(f"Hair depth threshold: {hair_depth_threshold:.4f}")
 
-                # Reduced strength
-                additive_matte = additive_matte * 0.3
+            # Direct depth evidence: how far above background threshold?
+            depth_range = fg_depth_max - hair_depth_threshold
+            depth_hair_evidence = np.where(
+                depth > hair_depth_threshold,
+                np.clip((depth - hair_depth_threshold) / (depth_range + 0.01), 0, 1),
+                0
+            )
 
-                # Combine with MAX
-                combined = np.maximum(combined, additive_matte)
+            # Use EXTENDED hair region for depth-based detection
+            depth_hair_evidence = depth_hair_evidence * hair_region * outside_mask.astype(np.float32)
 
-                self.logger.debug(f"After additive key (depth-gated): {np.sum(combined > 0.5)} pixels > 0.5")
+            self.logger.debug(f"Depth-based hair pixels (raw): {np.sum(depth_hair_evidence > 0.1)}")
+
+            # =================================================================
+            # METHOD 3: EDGE-FOCUSED HAIR REFINEMENT (PROFESSIONAL VFX)
+            # Focus on pixels VERY CLOSE to the mask edge where hair detail
+            # matters. Use stricter constraints to avoid ropes and debris.
+            # =================================================================
+
+            # Hair region (top 40% of subject bounding box)
+            hair_region_strict = self.detect_hair_region(alpha, extended=False)
+
+            # STEP 1: Define edge bands
+            # Hair strands can extend further - use larger search for hair region
+            max_hair_distance = self.hair_search_radius  # Full search radius for hair
+            max_edge_distance = 15  # Tight band for non-hair edges
+            hair_edge_band = (dist_outside > 0) & (dist_outside < max_hair_distance)
+            edge_band = hair_edge_band  # Will be further constrained below
+
+            # STEP 2: In hair region, pixels must:
+            #   a) Be close to mask edge
+            #   b) Have foreground depth (closer than background)
+            #   c) Have depth SIMILAR to adjacent mask pixels (continuity check)
+
+            # Get depth at mask edge (1-5px inside mask)
+            edge_inside = (dist_inside > 0) & (dist_inside < 5)
+            if np.sum(edge_inside & (hair_region_strict > 0.5)) > 100:
+                edge_depth = depth[edge_inside & (hair_region_strict > 0.5)]
+                edge_depth_mean = np.mean(edge_depth)
+                edge_depth_std = np.std(edge_depth)
+            else:
+                edge_depth_mean = fg_depth_median
+                edge_depth_std = 0.15
+
+            # Hair depth should be within range of edge depth (not random objects)
+            # Use wider range to capture more hair, but filter ropes morphologically
+            depth_similar_to_edge = (depth > edge_depth_mean - edge_depth_std * 3) & \
+                                    (depth < edge_depth_mean + edge_depth_std * 4)
+
+            self.logger.debug(f"Edge depth: mean={edge_depth_mean:.4f}, std={edge_depth_std:.4f}")
+
+            # MORPHOLOGICAL ROPE FILTER: Ropes are thin linear structures
+            # Create a mask of foreground-depth pixels and analyze shape
+            fg_outside = (depth > hair_depth_threshold) & outside_mask
+            fg_outside_uint8 = fg_outside.astype(np.uint8) * 255
+
+            # Opening removes thin structures (ropes) while preserving larger areas (hair mass)
+            open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            fg_opened = cv2.morphologyEx(fg_outside_uint8, cv2.MORPH_OPEN, open_kernel)
+
+            # Closing fills small gaps in hair regions
+            close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            fg_cleaned = cv2.morphologyEx(fg_opened, cv2.MORPH_CLOSE, close_kernel)
+
+            # Dilate slightly to recover edge detail
+            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            fg_cleaned = cv2.dilate(fg_cleaned, dilate_kernel, iterations=1)
+
+            # Use this as additional filter - pixels must be in cleaned region
+            rope_filter = (fg_cleaned > 0)
+            self.logger.debug(f"Rope filter: {np.sum(fg_outside)} -> {np.sum(rope_filter)} pixels")
+
+            # STEP 3: Valid hair pixels = edge band + foreground depth + similar to edge + rope filter
+            valid_hair = edge_band & (depth > hair_depth_threshold) & depth_similar_to_edge & rope_filter
+            # Further restrict to hair region
+            valid_hair_region = valid_hair & (hair_region_strict > 0.5)
+
+            # For general edges (not hair), use very tight band
+            edge_band_tiny = (dist_outside > 0) & (dist_outside < max_edge_distance)
+            valid_edge = edge_band_tiny & (depth > foreground_threshold)
+
+            # Combine: hair region uses hair logic, rest uses tight edge
+            valid_pixels = valid_hair_region | (valid_edge & (hair_region_strict < 0.5))
+
+            self.logger.debug(f"Valid hair pixels: {np.sum(valid_hair_region)}")
+            self.logger.debug(f"Valid edge pixels: {np.sum(valid_edge & (hair_region_strict < 0.5))}")
+
+            # STEP 4: Convert depth to alpha - use TEXTURE from depth map
+            # The depth map contains hair strand detail - preserve it!
+
+            # Get local normalization range from valid hair pixels
+            if np.sum(valid_hair_region) > 100:
+                hair_depths = depth[valid_hair_region]
+                hair_local_min = np.percentile(hair_depths, 2)
+                hair_local_max = np.percentile(hair_depths, 99)
+            else:
+                hair_local_min = hair_depth_threshold
+                hair_local_max = fg_depth_max
+
+            self.logger.debug(f"Hair LOCAL depth range: [{hair_local_min:.4f}, {hair_local_max:.4f}]")
+
+            depth_range = max(hair_local_max - hair_local_min, 0.1)
+
+            # PRIMARY: Normalize depth to 0-1 within hair range
+            depth_normalized = np.clip((depth - hair_local_min) / depth_range, 0, 1)
+
+            # Apply contrast curve to enhance hair strand visibility
+            # S-curve: boost mid-tones, compress extremes
+            depth_contrasted = depth_normalized ** 0.5  # Gamma for lift
+            depth_contrasted = np.clip(depth_contrasted * 1.3 - 0.15, 0, 1)  # Contrast
+
+            # Apply validity mask FIRST (before any smoothing)
+            depth_as_alpha = depth_contrasted * valid_pixels.astype(np.float32)
+
+            # TEXTURE PRESERVATION: High-pass filter to extract strand detail
+            # Blur to get low-frequency component
+            blur_size = 15
+            depth_blurred = cv2.GaussianBlur(depth_normalized, (blur_size, blur_size), 0)
+            # High-pass = original - blurred (the detail/texture)
+            depth_detail = depth_normalized - depth_blurred
+            # Boost and add back the detail where we have valid pixels
+            detail_boost = 2.0
+            depth_as_alpha = depth_as_alpha + (depth_detail * detail_boost * valid_pixels.astype(np.float32))
+            depth_as_alpha = np.clip(depth_as_alpha, 0, 1)
+
+            # Distance falloff - gentler for hair, steeper for edges
+            hair_falloff = np.clip(1.0 - (dist_outside / max_hair_distance) ** 0.6, 0, 1)
+            edge_falloff = np.clip(1.0 - (dist_outside / max_edge_distance), 0, 1)
+            falloff = np.where(hair_region_strict > 0.5, hair_falloff, edge_falloff)
+            depth_as_alpha = depth_as_alpha * falloff
+
+            self.logger.debug(f"Depth-as-alpha pixels > 0.3: {np.sum(depth_as_alpha > 0.3)}")
+
+            # =================================================================
+            # COMBINE all methods
+            # =================================================================
+            # PRIMARY: Direct depth-to-alpha (captures the actual hair texture from depth)
+            hair_evidence = depth_as_alpha.copy()
+
+            # ADD texture+color evidence where depth might have missed
+            hair_evidence = np.maximum(hair_evidence, hair_evidence_tc * 0.7)
+
+            # ADD depth-based binary evidence for further/edge pixels
+            hair_evidence = np.maximum(hair_evidence, depth_hair_evidence * 0.5)
+
+            # Scale by blend strength - this controls how much hair detail to add
+            hair_matte = hair_evidence * self.blend_strength
+
+            # Ensure minimum threshold to avoid noise
+            hair_matte = np.where(hair_matte > 0.05, hair_matte, 0)
+
+            self.logger.debug(f"Hair matte (combined): {np.sum(hair_matte > 0.1)} pixels detected")
 
         # =====================================================================
-        # FINAL: Clean up and ensure solid core
+        # STAGE 5: COMBINE (Matte Logic - MAX Operation)
         # =====================================================================
-        # Make sure core is absolutely solid (no floating point errors)
+        # Start with core
+        combined = core_matte.copy()
+
+        # Add edge detail
+        combined = np.maximum(combined, edge_matte)
+
+        # Add hair detail
+        combined = np.maximum(combined, hair_matte)
+
+        # Preserve original SAM2 alpha (it may have good edge info)
+        combined = np.maximum(combined, alpha * 0.9)
+
+        self.logger.debug(f"Combined: {np.sum(combined > 0.5)} pixels > 0.5")
+
+        # =====================================================================
+        # FINAL: Ensure solid core and clean edges
+        # =====================================================================
         combined = np.where(core_matte > 0.5, 1.0, combined)
 
-        # Clip to valid range
+        # Light smoothing to reduce noise
+        combined = cv2.GaussianBlur(combined, (3, 3), 0.5)
+
+        # Re-apply solid core after blur
+        combined = np.where(core_matte > 0.5, 1.0, combined)
+
         refined = np.clip(combined, 0, 1).astype(np.float32)
 
         return refined
@@ -887,21 +1222,102 @@ def save_alpha(
         cv2.imwrite(str(filepath), alpha_int)
 
 
+def save_depth_float(
+    depth: np.ndarray,
+    filepath: Path,
+):
+    """Save depth map as float EXR for proper precision."""
+    try:
+        import OpenEXR
+        import Imath
+
+        h, w = depth.shape
+        depth_float = depth.astype(np.float32)
+
+        header = OpenEXR.Header(w, h)
+        pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+        header['channels'] = {'Y': Imath.Channel(pixel_type)}
+
+        exr = OpenEXR.OutputFile(str(filepath), header)
+        exr.writePixels({'Y': depth_float.tobytes()})
+        exr.close()
+
+    except ImportError:
+        # Fallback to 16-bit PNG (loses some precision but still usable)
+        import cv2
+        depth_16 = (depth * 65535).astype(np.uint16)
+        cv2.imwrite(str(filepath), depth_16)
+
+
 def save_depth_visualization(
     depth: np.ndarray,
     filepath: Path,
     colormap: bool = True
 ):
-    """Save depth map as visualization."""
+    """Save depth map as colorized visualization (for preview only)."""
     import cv2
-    
+
     # Normalize
     depth_vis = (depth * 255).astype(np.uint8)
-    
+
     if colormap:
         depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
-    
+
     cv2.imwrite(str(filepath), depth_vis)
+
+
+def load_depth_float(filepath: Path) -> np.ndarray:
+    """Load depth map as float values (0-1 range)."""
+    import cv2
+
+    ext = filepath.suffix.lower()
+
+    if ext == '.exr':
+        try:
+            import OpenEXR
+            import Imath
+
+            exr_file = OpenEXR.InputFile(str(filepath))
+            header = exr_file.header()
+
+            dw = header['dataWindow']
+            width = dw.max.x - dw.min.x + 1
+            height = dw.max.y - dw.min.y + 1
+
+            # Try Y channel first, then R
+            channels = header['channels'].keys()
+            channel = 'Y' if 'Y' in channels else 'R' if 'R' in channels else list(channels)[0]
+
+            pt = Imath.PixelType(Imath.PixelType.FLOAT)
+            data = exr_file.channel(channel, pt)
+
+            depth = np.frombuffer(data, dtype=np.float32).reshape((height, width))
+            return depth
+
+        except ImportError:
+            pass
+
+    # Fallback: load with OpenCV
+    depth = cv2.imread(str(filepath), cv2.IMREAD_UNCHANGED)
+
+    if depth is None:
+        raise IOError(f"Cannot read depth: {filepath}")
+
+    # Handle different formats - convert to float 0-1
+    if len(depth.shape) == 3:
+        depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
+
+    if depth.dtype == np.uint8:
+        depth = depth.astype(np.float32) / 255.0
+    elif depth.dtype == np.uint16:
+        depth = depth.astype(np.float32) / 65535.0
+    else:
+        depth = depth.astype(np.float32)
+        # Normalize if not already 0-1
+        if depth.max() > 1.0:
+            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+
+    return depth
 
 
 # ==============================================================================
@@ -1034,8 +1450,12 @@ class DepthRefinePipeline:
                     )
 
                     if self.config.save_depth:
-                        depth_path = depth_dir / f"depth.{idx:04d}.png"
-                        save_depth_visualization(depth, depth_path)
+                        # Save float EXR for actual depth data (for reuse/processing)
+                        depth_float_path = depth_dir / f"depth.{idx:04d}.exr"
+                        save_depth_float(depth, depth_float_path)
+                        # Also save colorized visualization for preview
+                        depth_vis_path = depth_dir / f"depth_preview.{idx:04d}.png"
+                        save_depth_visualization(depth, depth_vis_path)
                 else:
                     self.logger.warning(f"No frame for depth computation at index {idx} (have {len(frame_files)} frames), skipping")
                     continue

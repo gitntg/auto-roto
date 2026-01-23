@@ -879,21 +879,14 @@ class SAM2Segmenter:
             raise
         
         checkpoint, config = self.MODEL_CONFIGS[self.model_size]
-        
+
         # Check if checkpoint exists, download if not
         checkpoint_path = self._ensure_checkpoint(checkpoint)
-        
-        # Find config path (relative to SAM2 installation)
-        import sam2
-        sam2_dir = Path(sam2.__file__).parent.parent
-        config_path = sam2_dir / config
-        
-        if not config_path.exists():
-            # Try alternate location
-            config_path = sam2_dir / "sam2" / config.replace("configs/", "configs/")
-        
+
+        # Hydra expects relative config name, not absolute path
+        # The config is searched in sam2's package config search path
         self.predictor = build_sam2_video_predictor(
-            str(config_path),
+            config,  # Just the relative config name like "configs/sam2.1/sam2.1_hiera_s.yaml"
             str(checkpoint_path),
             device=self.device,
             vos_optimized=self.compile_model
@@ -1331,12 +1324,14 @@ class AutoRotoPipeline:
             if self.config.propagate_forward:
                 for frame_idx, obj_ids, masks in self.sam.propagate(reverse=False):
                     # Combine all object masks
-                    # SAM2 outputs masks as (num_objects, 1, H, W), need to squeeze to (H, W)
+                    # SAM2 outputs masks as logits (num_objects, 1, H, W), need sigmoid to convert to probabilities
                     combined = np.zeros(masks.shape[-2:], dtype=np.float32)
                     for mask in masks:
                         # Squeeze out any extra dimensions (e.g., channel dim)
                         mask_2d = mask.squeeze()
-                        combined = np.maximum(combined, mask_2d.astype(np.float32))
+                        # Apply sigmoid to convert logits to probabilities (0-1)
+                        mask_prob = 1.0 / (1.0 + np.exp(-mask_2d.astype(np.float32)))
+                        combined = np.maximum(combined, mask_prob)
                     all_masks[frame_idx] = combined
                     
                     if frame_idx % 10 == 0:
@@ -1350,7 +1345,9 @@ class AutoRotoPipeline:
                         combined = np.zeros(masks.shape[-2:], dtype=np.float32)
                         for mask in masks:
                             mask_2d = mask.squeeze()
-                            combined = np.maximum(combined, mask_2d.astype(np.float32))
+                            # Apply sigmoid to convert logits to probabilities (0-1)
+                            mask_prob = 1.0 / (1.0 + np.exp(-mask_2d.astype(np.float32)))
+                            combined = np.maximum(combined, mask_prob)
                         all_masks[frame_idx] = combined
             
             # Process and write frames
