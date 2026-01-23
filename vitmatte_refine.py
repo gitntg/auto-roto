@@ -486,13 +486,11 @@ class TrimapSynthesizer:
         # =====================================================================
         # STEP 4: FORMULAIC EROSION (The "Smart Core")
         # =====================================================================
-        # Erosion also adapts to local complexity:
-        # - Smooth regions (complexity 0) → Erode 1px (safety margin only)
-        # - Complex regions like hair (complexity 1) → Erode 15px (deep root blending)
-        erosion_threshold = (
-            self.config.erosion_base_px +
-            (self.config.erosion_max_px * complexity_map)
-        )
+        # Increase the multiplier from 14.0 to 40.0
+        # This forces the solid white core to retreat much deeper into the hair
+
+        # Base 2.0 (tighter shoulder) + 40.0 (deep hair retreat)
+        erosion_threshold = 2.0 + (40.0 * complexity_map)
 
         # Create the Dynamic Core
         # A pixel is core ONLY if it is deep enough inside (beyond erosion threshold)
@@ -1161,13 +1159,13 @@ class GeometricMatteRefiner:
                 # Convert RGB to linear for better edge detection
                 rgb_linear = srgb_to_linear(rgb.astype(np.float32) / 255.0)
 
-                # Guided Filter: radius=2 preserves single-pixel hair strands
-                # Lower radius = less aggressive smoothing, better fine detail
+                # Guided Filter
+                # Radius 4 is cleaner for high-res footage than 2
                 alpha_refined = ximgproc.guidedFilter(
                     guide=rgb_linear,
                     src=alpha.astype(np.float32),
-                    radius=2,
-                    eps=1e-6
+                    radius=4,    # Smooths the blockiness
+                    eps=1e-5     # Slightly tighter edge adherence
                 )
 
                 # =====================================================================
