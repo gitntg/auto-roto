@@ -409,6 +409,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Edge refinement failed, continuing with previous output")
             edge_output = vitmatte_output
+
+        clear_gpu_memory()  # Clean up after Edge Refinement
     else:
         logger.info("Skipping Edge Refinement (--skip-edge)")
         edge_output = vitmatte_output
@@ -445,6 +447,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Temporal smoothing failed, continuing with previous output")
             temporal_output = edge_output
+
+        clear_gpu_memory()  # Clean up after Temporal Smoothing
     else:
         logger.info("Skipping Temporal Smoothing (--skip-temporal)")
         temporal_output = edge_output
@@ -481,6 +485,8 @@ def run_pipeline(config: PipelineConfig):
         if not success:
             logger.warning("Matte combination failed, using previous output")
             combine_output = temporal_output
+
+        clear_gpu_memory()  # Clean up after Matte Combination
     else:
         logger.info("Skipping Matte Combination (--skip-combine)")
         combine_output = temporal_output

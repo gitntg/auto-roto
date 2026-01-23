@@ -1009,6 +1009,39 @@ class SAM2Segmenter:
                 masks_np = masks.cpu().numpy()
                 yield frame_idx, object_ids, masks_np
 
+    def release(self) -> None:
+        """Release model and free GPU memory."""
+        import torch
+        import gc
+        
+        if self.predictor is not None:
+            del self.predictor
+            self.predictor = None
+        
+        if self.state is not None:
+            del self.state
+            self.state = None
+        
+        self.logger.debug("SAM2Segmenter model released")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
+
 
 # ==============================================================================
 # GROUNDING DINO WRAPPER
@@ -1176,6 +1209,36 @@ class GroundingDINODetector:
         self.logger.info(f"Detected {len(boxes_pixel)} objects for prompt: '{prompt}'")
         
         return boxes_pixel, phrases
+
+    def release(self) -> None:
+        """Release model and free GPU memory."""
+        import torch
+        import gc
+        
+        if self.model is not None:
+            del self.model
+            self.model = None
+            self.predict_fn = None
+        
+        self.logger.debug("GroundingDINODetector model released")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        gc.collect()
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
 
 
 # ==============================================================================
@@ -1429,6 +1492,49 @@ class AutoRotoPipeline:
         cv2.destroyAllWindows()
         
         return boxes
+
+    def release(self) -> None:
+        """Release all resources and free GPU memory."""
+        if self._sam is not None:
+            self._sam.release()
+            self._sam = None
+        
+        if self._detector is not None:
+            self._detector.release()
+            self._detector = None
+        
+        if self._refiner is not None:
+            self._refiner = None
+        
+        if self._reader is not None:
+            self._reader = None
+        
+        if self._writer is not None:
+            self._writer = None
+        
+        # Clear GPU memory
+        try:
+            import torch
+            import gc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            gc.collect()
+        except ImportError:
+            pass
+
+    def __del__(self):
+        """Destructor to ensure cleanup."""
+        self.release()
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with cleanup."""
+        self.release()
+        return False
 
 
 # ==============================================================================
