@@ -40,7 +40,7 @@ requests>=2.31.0
 # OpenEXR>=3.2.0
 
 # Optional: Better guided filter (part of opencv-contrib)
-# opencv-contrib-python>=4.8.0
+opencv-contrib-python>=4.8.0
 
 # Hugging Face (for easy model loading)
 huggingface_hub>=0.19.0

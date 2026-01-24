@@ -130,24 +130,9 @@ class DepthEstimator:
         "nested-base": "depth-anything/DA3NESTED-Base",
     }
 
-    # Maximum process_res by model (nested handles higher res natively)
-    # These are the max resolutions the model can process in a single pass
-    MAX_PROCESS_RES_BY_MODEL = {
-        "small": 768,
-        "base": 1024,
-        "large": 2048,  # Uncapped for fine detail (was 1024)
-        "nested-large": 2048,   # Nested architecture handles higher res natively
-        "nested-base": 1536,
-    }
-
-    # Whether model supports direct high-res (no tiling needed)
-    SUPPORTS_DIRECT_HIGHRES = {
-        "small": False,
-        "base": False,
-        "large": False,
-        "nested-large": True,   # Nested models process high-res directly
-        "nested-base": True,
-    }
+    # Resolution settings
+    MAX_PROCESS_RES = 8192  # 8K cap to prevent extreme memory usage
+    DEFAULT_PROCESS_RES = None  # None = use image size (capped at MAX_PROCESS_RES)
     
     def __init__(
         self,
@@ -162,13 +147,6 @@ class DepthEstimator:
         self.model = None
         self._load_model()
 
-    def get_max_process_res(self) -> int:
-        """Get max process_res for the loaded model."""
-        return self.MAX_PROCESS_RES_BY_MODEL.get(self.model_size, 1024)
-
-    def supports_direct_highres(self) -> bool:
-        """Check if model supports direct high-res processing (no tiling)."""
-        return self.SUPPORTS_DIRECT_HIGHRES.get(self.model_size, False)
     
     def _load_model(self):
         """Load Depth Anything 3 model."""
@@ -196,10 +174,13 @@ class DepthEstimator:
 
         Args:
             image: RGB image (H, W, 3), uint8 or float
-            process_res: Processing resolution (default: use model's max)
+            process_res: Processing resolution (default: use image size, capped at 8K)
 
         Returns:
-            Depth map (H, W), float32, normalized 0-1 (closer = lower values)
+            Depth map (H, W), float32, normalized 0-1 (closer = LOWER values)
+            This follows DA3's native depth convention where:
+            - Foreground (close to camera) = LOW values (e.g., 0.1-0.3)
+            - Background (far from camera) = HIGH values (e.g., 0.6-0.9)
         """
         import torch
         import cv2
@@ -210,12 +191,11 @@ class DepthEstimator:
 
         h, w = image.shape[:2]
 
-        # Determine process_res: use provided, or model's max, capped at image size
-        max_res = self.get_max_process_res()
+        # Use provided process_res, or default to image size (capped at 8K)
         if process_res is None:
-            process_res = min(max(h, w), max_res)
+            process_res = min(max(h, w), self.MAX_PROCESS_RES)
         else:
-            process_res = min(process_res, max_res)
+            process_res = min(process_res, self.MAX_PROCESS_RES)
 
         self.logger.debug(f"Estimating depth at process_res={process_res} (image: {w}x{h})")
 
@@ -235,25 +215,30 @@ class DepthEstimator:
         p_low, p_high = np.percentile(depth, [2, 98])
         depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
 
+        # Note: DA3 outputs depth (not disparity), so closer = LOWER values
+        # This is the standard depth convention - no inversion needed
+
         return depth.astype(np.float32)
 
     def normalize_for_foreground(
         self,
         depth: np.ndarray,
         mask: np.ndarray,
-        foreground_range: tuple = (0.0, 0.6)
+        foreground_range: tuple = (0.0, 0.4)
     ) -> np.ndarray:
         """
         Re-normalize depth to expand foreground detail.
 
-        Standard depth normalization compresses the foreground (close objects)
-        into a narrow range. This method expands the foreground region to use
+        Standard depth normalization may compress foreground variation.
+        This method expands the foreground region (where mask > 0.5) to use
         more of the 0-1 range, preserving fine detail like hair.
 
+        Note: Depth convention is closer = LOWER values (foreground is low).
+
         Args:
-            depth: Depth map (H, W), already normalized 0-1
+            depth: Depth map (H, W), normalized 0-1 (closer = lower)
             mask: Alpha mask (H, W) where foreground > 0.5
-            foreground_range: Target range for foreground depths (default 0-0.6)
+            foreground_range: Target range for foreground depths (default 0.0-0.4)
 
         Returns:
             Re-normalized depth map with expanded foreground detail
@@ -268,6 +253,7 @@ class DepthEstimator:
         fg_depths = depth[fg_mask]
 
         # Find foreground depth range (use percentiles for robustness)
+        # Foreground (close) has LOW depth values
         fg_min = np.percentile(fg_depths, 5)
         fg_max = np.percentile(fg_depths, 95)
         fg_range = fg_max - fg_min
@@ -288,10 +274,10 @@ class DepthEstimator:
         scale = target_range / fg_range
         enhanced = (depth - fg_min) * scale + target_min
 
-        # Background depths (> fg_max) get compressed into remaining range
+        # Background depths (> fg_max) get compressed into remaining range [target_max, 1.0]
+        # With standard depth: background = HIGH values, foreground = LOW values
         bg_mask = depth > fg_max
         if np.any(bg_mask):
-            bg_depths = depth[bg_mask]
             bg_min_orig = fg_max
             bg_max_orig = depth.max()
             bg_range_orig = bg_max_orig - bg_min_orig + 1e-8
@@ -381,14 +367,7 @@ class DepthEstimator:
 
         h, w = image.shape[:2]
 
-        # For nested models: use direct high-res processing (no tiling needed)
-        if self.supports_direct_highres():
-            max_res = self.get_max_process_res()
-            process_res = min(max(h, w), max_res)
-            self.logger.info(f"Direct high-res depth: {w}x{h} at process_res={process_res}")
-            return self.estimate(image, process_res=process_res)
-
-        # For non-nested models: use tiled processing
+        # Tiled processing for memory efficiency on large images
         # If image is smaller than tile size, just use regular estimation
         if h <= tile_size and w <= tile_size:
             return self.estimate(image)
@@ -652,13 +631,13 @@ class DepthGuidedRefiner:
         color_similarity = np.exp(-(color_diff ** 2) / (2 * (color_tolerance ** 2)))
 
         # RANGE-BASED depth gating - hair can be CLOSER than body
-        # Accept any depth in foreground range or closer
-        depth_ok = depth > foreground_threshold
+        # Accept any depth in foreground range or closer (close = LOW depth)
+        depth_ok = depth < foreground_threshold
 
         # Extra boost for pixels at hair-like depth (very close to camera)
-        # Hair is typically the closest thing (highest depth value)
+        # Hair is typically the closest thing (LOWEST depth value)
         hair_depth_boost = np.where(
-            depth > fg_depth_max - 0.05,  # very close to camera
+            depth < fg_depth_min + 0.05,  # very close to camera (low depth)
             1.5,  # boost
             1.0
         )
@@ -738,6 +717,10 @@ class DepthGuidedRefiner:
         """
         Analyze depth statistics for foreground and background regions.
 
+        Note: Depth convention is closer = LOWER values.
+        - Foreground (close to camera) has LOW depth values
+        - Background (far from camera) has HIGH depth values
+
         Returns:
             Dictionary with depth statistics including thresholds.
         """
@@ -747,7 +730,7 @@ class DepthGuidedRefiner:
         dist_inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 5)
         deep_core = dist_inside > 30
 
-        # Foreground depth statistics
+        # Foreground depth statistics (close = LOW values)
         if np.sum(deep_core) > 100:
             fg_depth_median = np.median(depth[deep_core])
             fg_depth_std = np.std(depth[deep_core])
@@ -759,22 +742,31 @@ class DepthGuidedRefiner:
             fg_depth_min = fg_depth_median - 0.15
             fg_depth_max = fg_depth_median + 0.15
 
-        # Background depth statistics
+        # Background depth statistics (far = HIGH values)
         bg_region = dist_inside == 0
         if np.sum(bg_region) > 100:
             bg_depth_median = np.median(depth[bg_region])
+            bg_depth_min = np.percentile(depth[bg_region], 5)
             bg_depth_max = np.percentile(depth[bg_region], 95)
         else:
-            bg_depth_median = 0.2
-            bg_depth_max = 0.3
+            # Defaults for when no background region detected
+            # Background should have HIGH values (far from camera)
+            bg_depth_median = 0.7
+            bg_depth_min = 0.6
+            bg_depth_max = 0.8
 
-        # Compute thresholds
-        foreground_threshold = bg_depth_max + self.depth_tolerance
-        hair_foreground_threshold = bg_depth_median + (bg_depth_max - bg_depth_median) * 0.5 + 0.05
+        # Compute thresholds for foreground detection
+        # Foreground = depth < threshold (close objects have LOW depth)
+        # Threshold is just above the maximum foreground depth
+        foreground_threshold = fg_depth_max + self.depth_tolerance
+
+        # Hair threshold is slightly more permissive (allows slightly further depths)
+        hair_foreground_threshold = fg_depth_max + self.depth_tolerance * 1.5
 
         self.logger.debug(f"Foreground depth (float): median={fg_depth_median:.4f}, "
                          f"range=[{fg_depth_min:.4f}, {fg_depth_max:.4f}]")
-        self.logger.debug(f"Background depth (float): median={bg_depth_median:.4f}, max={bg_depth_max:.4f}")
+        self.logger.debug(f"Background depth (float): median={bg_depth_median:.4f}, "
+                         f"range=[{bg_depth_min:.4f}, {bg_depth_max:.4f}]")
         self.logger.debug(f"Foreground threshold: {foreground_threshold:.4f}")
         self.logger.debug(f"Hair foreground threshold: {hair_foreground_threshold:.4f}")
 
@@ -784,6 +776,7 @@ class DepthGuidedRefiner:
             'fg_depth_min': fg_depth_min,
             'fg_depth_max': fg_depth_max,
             'bg_depth_median': bg_depth_median,
+            'bg_depth_min': bg_depth_min,
             'bg_depth_max': bg_depth_max,
             'foreground_threshold': foreground_threshold,
             'hair_foreground_threshold': hair_foreground_threshold,
@@ -817,12 +810,12 @@ class DepthGuidedRefiner:
         outer_edge_dist = float(self.hair_search_radius)
         spatial_edge_region = (dist_inside <= inner_edge_dist) | (dist_outside <= outer_edge_dist)
 
-        # Depth-based foreground detection
-        is_foreground_depth = depth > foreground_threshold
+        # Depth-based foreground detection (close = LOW depth)
+        is_foreground_depth = depth < foreground_threshold
 
-        # Compute confidence
-        depth_margin = depth - foreground_threshold
-        depth_confidence = np.clip(depth_margin / (fg_depth_max - foreground_threshold + 0.01), 0, 1)
+        # Compute confidence: higher confidence for depths closer to fg_depth_min (closest)
+        depth_margin = foreground_threshold - depth  # How much BELOW threshold
+        depth_confidence = np.clip(depth_margin / (foreground_threshold - fg_depth_min + 0.01), 0, 1)
 
         # Boost for pixels in foreground range
         in_fg_range = (depth >= fg_depth_min - 0.05) & (depth <= fg_depth_max + 0.1)
@@ -856,10 +849,11 @@ class DepthGuidedRefiner:
         Apply morphological filter to remove thin linear structures (ropes).
 
         Ropes are thin linear structures that should not be included in hair detection.
+        Note: Foreground = depth < threshold (close = LOW depth values)
         """
         import cv2
 
-        fg_outside = (depth > hair_depth_threshold) & outside_mask
+        fg_outside = (depth < hair_depth_threshold) & outside_mask
         fg_outside_uint8 = fg_outside.astype(np.uint8) * 255
 
         # Opening removes thin structures
@@ -888,13 +882,17 @@ class DepthGuidedRefiner:
     ) -> np.ndarray:
         """
         Convert depth values to alpha values with texture preservation.
+
+        Note: Depth convention is closer = LOWER values.
+        Closer objects (low depth) should have HIGHER alpha (more opaque).
         """
         import cv2
 
         depth_range = max(hair_local_max - hair_local_min, 0.1)
 
         # Normalize depth to 0-1 within hair range
-        depth_normalized = np.clip((depth - hair_local_min) / depth_range, 0, 1)
+        # INVERT: closer (low depth) = higher alpha
+        depth_normalized = np.clip((hair_local_max - depth) / depth_range, 0, 1)
 
         # Contrast curve to enhance hair strand visibility
         depth_contrasted = depth_normalized ** 0.5
@@ -984,12 +982,12 @@ class DepthGuidedRefiner:
         hair_evidence_tc = hair_texture * hair_color * is_foreground_depth.astype(np.float32)
         hair_evidence_tc = hair_evidence_tc * hair_region_normal * outside_mask.astype(np.float32)
 
-        # METHOD 2: Direct depth-based hair
+        # METHOD 2: Direct depth-based hair (close = LOW depth)
         self.logger.debug(f"Hair depth threshold: {hair_depth_threshold:.4f}")
-        depth_range = fg_depth_max - hair_depth_threshold
+        depth_range = hair_depth_threshold - fg_depth_min
         depth_hair_evidence = np.where(
-            depth > hair_depth_threshold,
-            np.clip((depth - hair_depth_threshold) / (depth_range + 0.01), 0, 1),
+            depth < hair_depth_threshold,  # Foreground is BELOW threshold
+            np.clip((hair_depth_threshold - depth) / (depth_range + 0.01), 0, 1),
             0
         )
         depth_hair_evidence = depth_hair_evidence * hair_region * outside_mask.astype(np.float32)
@@ -1018,12 +1016,12 @@ class DepthGuidedRefiner:
         # Apply rope filter
         rope_filter = self._apply_rope_filter(depth, hair_depth_threshold, outside_mask)
 
-        # Compute valid pixels
-        valid_hair = hair_edge_band & (depth > hair_depth_threshold) & depth_similar_to_edge & rope_filter
+        # Compute valid pixels (close = LOW depth)
+        valid_hair = hair_edge_band & (depth < hair_depth_threshold) & depth_similar_to_edge & rope_filter
         valid_hair_region = valid_hair & (hair_region_strict > 0.5)
 
         edge_band_tiny = (dist_outside > 0) & (dist_outside < max_edge_distance)
-        valid_edge = edge_band_tiny & (depth > foreground_threshold)
+        valid_edge = edge_band_tiny & (depth < foreground_threshold)
         valid_pixels = valid_hair_region | (valid_edge & (hair_region_strict < 0.5))
 
         self.logger.debug(f"Valid hair pixels: {np.sum(valid_hair_region)}")

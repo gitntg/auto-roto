@@ -843,6 +843,8 @@ def parse_args():
                        help="Inner edge band width (default: 8)")
     parser.add_argument("--outer-band", type=int, default=12,
                        help="Outer edge band width (default: 12)")
+    parser.add_argument("--core-erosion", type=int, dest="core_shrink", default=3,
+                       help="Core erosion pixels (alias for core-shrink)")
     parser.add_argument("--core-shrink", type=int, default=3,
                        help="Core shrink pixels (default: 3)")
     parser.add_argument("--edge-extend", type=int, default=2,
