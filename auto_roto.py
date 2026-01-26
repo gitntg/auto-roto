@@ -857,10 +857,16 @@ class SAM2Segmenter:
         self.device = device
         self.logger = logger or logging.getLogger("SAM2")
 
-        # Auto-disable compile on Windows (torch.compile has known issues)
+        # Check Windows + triton availability for torch.compile
         if compile_model and platform.system() == "Windows":
-            self.logger.info("Windows detected - disabling torch.compile for SAM2")
-            compile_model = False
+            try:
+                import triton
+                # triton-windows 3.3+ with PyTorch 2.7+ supports torch.compile
+                self.logger.info(f"Windows with triton {triton.__version__} - torch.compile enabled")
+            except ImportError:
+                self.logger.info("Windows without triton - disabling torch.compile for SAM2")
+                self.logger.info("  Install triton-windows for compilation: pip install triton-windows>=3.3")
+                compile_model = False
 
         self.compile_model = compile_model
 
