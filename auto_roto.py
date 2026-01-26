@@ -60,6 +60,7 @@ import os
 import sys
 import argparse
 import logging
+import platform
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any, Union
 from dataclasses import dataclass, field
@@ -854,12 +855,18 @@ class SAM2Segmenter:
     ):
         self.model_size = model_size
         self.device = device
-        self.compile_model = compile_model
         self.logger = logger or logging.getLogger("SAM2")
-        
+
+        # Auto-disable compile on Windows (torch.compile has known issues)
+        if compile_model and platform.system() == "Windows":
+            self.logger.info("Windows detected - disabling torch.compile for SAM2")
+            compile_model = False
+
+        self.compile_model = compile_model
+
         self.predictor = None
         self.state = None
-        
+
         self._load_model()
     
     def _load_model(self):

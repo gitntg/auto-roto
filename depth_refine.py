@@ -40,7 +40,7 @@ import sys
 import argparse
 import logging
 from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Generator
+from typing import Optional, List, Tuple, Dict, Generator, Union
 from dataclasses import dataclass
 import time
 
@@ -53,21 +53,28 @@ import numpy as np
 @dataclass
 class DepthRefineConfig:
     """Configuration for depth-guided refinement."""
-    
+
     # Input paths
     alpha_dir: str = ""           # Directory with alpha mattes
     frames_dir: str = ""          # Directory with RGB frames (optional)
     depth_dir: str = ""           # Pre-computed depth maps (optional)
     video_path: str = ""          # Video file (optional, for depth computation)
-    
+
     # Output
     output_dir: str = "./refined"
-    
+
     # Depth model settings
     depth_model: str = "large"    # large (DA3Mono) best for hair detail; nested smooths fine detail
     compute_depth: bool = True    # Compute depth if not provided
     save_depth: bool = True       # Save depth maps for reuse
-    
+
+    # DA3 Resolution Settings (NEW)
+    # These control how DA3 processes images for fine detail capture
+    depth_process_res: Optional[int] = None   # None = auto (image size), or explicit value like 1024, 2048
+    depth_process_method: str = "upper"       # "upper" or "lower" bound resize
+    depth_norm_percentiles: Tuple[float, float] = (2.0, 98.0)  # Percentiles for normalization
+    use_depth_confidence: bool = False        # Use DA3 confidence maps for filtering
+
     # Refinement settings
     edge_threshold: float = 0.1   # Depth gradient threshold for edges
     blend_strength: float = 0.7   # How much to blend depth-based refinement
@@ -81,15 +88,15 @@ class DepthRefineConfig:
     hair_search_radius: int = 50      # How far outside mask to search for hair
     depth_tolerance: float = 0.15     # Depth similarity tolerance for hair
     min_hair_alpha: float = 0.3       # Minimum alpha value for detected hair
-    
+
     # Output settings
     output_format: str = "exr"
     bit_depth: int = 16
-    
+
     # Performance
     device: str = "cuda"
     batch_size: int = 4
-    
+
     # Debug
     verbose: bool = False
     save_debug: bool = False      # Save intermediate visualizations
@@ -133,16 +140,27 @@ class DepthEstimator:
     # Resolution settings
     MAX_PROCESS_RES = 8192  # 8K cap to prevent extreme memory usage
     DEFAULT_PROCESS_RES = None  # None = use image size (capped at MAX_PROCESS_RES)
-    
+
     def __init__(
         self,
         model_size: str = 'large',
         device: str = 'cuda',
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        # New DA3 sensitivity parameters
+        process_res: Optional[int] = None,          # Explicit resolution or None for auto
+        process_method: str = "upper",              # "upper" or "lower" bound resize
+        norm_percentiles: Tuple[float, float] = (2.0, 98.0),  # Percentiles for normalization
+        use_confidence: bool = False                 # Use DA3 confidence maps
     ):
         self.model_size = model_size
         self.device = device
         self.logger = logger or logging.getLogger("DepthEstimator")
+
+        # DA3 sensitivity settings
+        self.process_res = process_res
+        self.process_method = process_method  # "upper" or "lower"
+        self.norm_percentiles = norm_percentiles
+        self.use_confidence = use_confidence
 
         self.model = None
         self._load_model()
@@ -168,19 +186,21 @@ class DepthEstimator:
 
         self.logger.info("Depth Anything 3 loaded successfully")
     
-    def estimate(self, image: np.ndarray, process_res: int = None) -> np.ndarray:
+    def estimate(self, image: np.ndarray, process_res: int = None) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Estimate depth from RGB image.
 
         Args:
             image: RGB image (H, W, 3), uint8 or float
-            process_res: Processing resolution (default: use image size, capped at 8K)
+            process_res: Processing resolution override (default: use instance setting or image size)
 
         Returns:
             Depth map (H, W), float32, normalized 0-1 (closer = LOWER values)
             This follows DA3's native depth convention where:
             - Foreground (close to camera) = LOW values (e.g., 0.1-0.3)
             - Background (far from camera) = HIGH values (e.g., 0.6-0.9)
+
+            If use_confidence is True, returns tuple: (depth, confidence)
         """
         import torch
         import cv2
@@ -191,33 +211,66 @@ class DepthEstimator:
 
         h, w = image.shape[:2]
 
-        # Use provided process_res, or default to image size (capped at 8K)
+        # Determine process_res: argument > instance setting > auto (image size)
         if process_res is None:
-            process_res = min(max(h, w), self.MAX_PROCESS_RES)
+            if self.process_res is not None:
+                process_res = min(self.process_res, self.MAX_PROCESS_RES)
+            else:
+                process_res = min(max(h, w), self.MAX_PROCESS_RES)
         else:
             process_res = min(process_res, self.MAX_PROCESS_RES)
 
-        self.logger.debug(f"Estimating depth at process_res={process_res} (image: {w}x{h})")
+        # Determine process_res_method from instance setting
+        # "upper" -> "upper_bound_resize": process_res is max dimension (standard)
+        # "lower" -> "lower_bound_resize": process_res is min dimension (higher effective res)
+        process_method = f"{self.process_method}_bound_resize"
+
+        self.logger.debug(
+            f"Estimating depth at process_res={process_res}, method={process_method} "
+            f"(image: {w}x{h}, percentiles={self.norm_percentiles})"
+        )
 
         with torch.no_grad():
             prediction = self.model.inference(
                 [image],
                 process_res=process_res,
-                process_res_method="upper_bound_resize",
+                process_res_method=process_method,
             )
         depth = prediction.depth[0]
+
+        # Extract confidence map if available and requested
+        confidence = None
+        if self.use_confidence and hasattr(prediction, 'conf') and prediction.conf is not None:
+            confidence = prediction.conf[0]
+            if confidence.shape != (h, w):
+                confidence = cv2.resize(confidence, (w, h), interpolation=cv2.INTER_LINEAR)
+            confidence = confidence.astype(np.float32)
+            self.logger.debug(f"Confidence map extracted: range [{confidence.min():.3f}, {confidence.max():.3f}]")
 
         # Resize depth to match input image size
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Normalize to 0-1 using percentiles to avoid outlier sensitivity
-        p_low, p_high = np.percentile(depth, [2, 98])
+        # Normalize to 0-1 using configurable percentiles
+        # Wider percentiles (e.g., 0.5, 99.5) preserve more depth variation for fine details
+        # Narrower percentiles (e.g., 2, 98) are more robust to outliers
+        p_low, p_high = np.percentile(depth, list(self.norm_percentiles))
         depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
+
+        # Optional: Apply confidence weighting to reduce noise in uncertain regions
+        if confidence is not None and self.use_confidence:
+            # Weight depth by confidence (high confidence = keep depth, low = smooth toward mean)
+            # This helps reduce noise at fine edges like hair strands
+            depth_mean = np.mean(depth)
+            confidence_weight = np.clip(confidence, 0.3, 1.0)  # Floor at 0.3 to avoid zeroing out
+            depth = depth * confidence_weight + depth_mean * (1 - confidence_weight)
+            self.logger.debug(f"Applied confidence weighting to depth")
 
         # Note: DA3 outputs depth (not disparity), so closer = LOWER values
         # This is the standard depth convention - no inversion needed
 
+        if self.use_confidence and confidence is not None:
+            return depth.astype(np.float32), confidence
         return depth.astype(np.float32)
 
     def normalize_for_foreground(
@@ -416,7 +469,9 @@ class DepthEstimator:
                     tile = padded
 
                 # Estimate depth for this tile
-                tile_depth = self.estimate(tile)
+                # Handle tuple return when use_confidence is enabled
+                result = self.estimate(tile)
+                tile_depth = result[0] if isinstance(result, tuple) else result
 
                 # DA3 may return different dimensions - resize to match tile
                 if tile_depth.shape != (tile_size, tile_size):
@@ -1448,7 +1503,12 @@ class DepthRefinePipeline:
             self._depth_estimator = DepthEstimator(
                 model_size=self.config.depth_model,
                 device=self.config.device,
-                logger=self.logger
+                logger=self.logger,
+                # New DA3 sensitivity parameters
+                process_res=self.config.depth_process_res,
+                process_method=self.config.depth_process_method,
+                norm_percentiles=self.config.depth_norm_percentiles,
+                use_confidence=self.config.use_depth_confidence,
             )
         return self._depth_estimator
     
@@ -1693,7 +1753,7 @@ class DepthRefinePipeline:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Depth-Guided Alpha Refinement using Depth Anything V2",
+        description="Depth-Guided Alpha Refinement using Depth Anything V3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:
@@ -1709,6 +1769,14 @@ EXAMPLES:
   # Adjust refinement settings
   %(prog)s --alpha ./output/alpha/ --frames ./frames/ \\
       --edge-threshold 0.15 --blend-strength 0.7 --output ./refined/
+
+  # HIGH RESOLUTION for fine hair detail (NEW)
+  %(prog)s --alpha ./alpha --frames ./frames --output ./refined \\
+      --depth-res 2048 --depth-method lower --depth-percentiles 1 99
+
+  # With confidence filtering for semi-transparent edges
+  %(prog)s --alpha ./alpha --frames ./frames --output ./refined \\
+      --use-depth-confidence --depth-percentiles 0.5 99.5
         """
     )
     
@@ -1729,7 +1797,23 @@ EXAMPLES:
                        help="Depth Anything 3 model (large=DA3Mono best for hair detail)")
     parser.add_argument("--no-save-depth", action="store_true",
                        help="Don't save computed depth maps")
-    
+
+    # DA3 Resolution/Sensitivity Settings (NEW)
+    parser.add_argument("--depth-res", type=int, default=None,
+                       help="DA3 processing resolution (default: auto=image size). "
+                            "Higher values (1024, 2048) capture finer details like hair strands")
+    parser.add_argument("--depth-method", type=str, default="upper",
+                       choices=["upper", "lower"],
+                       help="DA3 resize method: 'upper' = process_res is max dimension (standard), "
+                            "'lower' = process_res is min dimension (higher effective resolution)")
+    parser.add_argument("--depth-percentiles", type=float, nargs=2, default=[2.0, 98.0],
+                       metavar=("LOW", "HIGH"),
+                       help="Normalization percentiles for depth. Wider range (1, 99) preserves "
+                            "more depth variation for fine details. Default: 2 98")
+    parser.add_argument("--use-depth-confidence", action="store_true",
+                       help="Use DA3 confidence maps to filter uncertain depth values "
+                            "(helps with semi-transparent edges)")
+
     # Refinement settings
     parser.add_argument("--edge-threshold", type=float, default=0.1,
                        help="Depth gradient threshold for hard edges (0.05-0.2)")
@@ -1767,7 +1851,7 @@ EXAMPLES:
 
 def main():
     args = parse_args()
-    
+
     config = DepthRefineConfig(
         alpha_dir=args.alpha,
         frames_dir=args.frames or "",
@@ -1776,6 +1860,12 @@ def main():
         output_dir=args.output,
         depth_model=args.depth_model,
         save_depth=not args.no_save_depth,
+        # DA3 sensitivity settings (NEW)
+        depth_process_res=args.depth_res,
+        depth_process_method=args.depth_method,
+        depth_norm_percentiles=tuple(args.depth_percentiles),
+        use_depth_confidence=args.use_depth_confidence,
+        # Refinement settings
         edge_threshold=args.edge_threshold,
         blend_strength=args.blend_strength,
         sharpen_hard_edges=not args.no_sharpen,
@@ -1791,7 +1881,7 @@ def main():
         verbose=args.verbose,
         save_debug=args.debug,
     )
-    
+
     pipeline = DepthRefinePipeline(config)
     pipeline.run()
 

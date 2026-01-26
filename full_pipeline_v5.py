@@ -44,6 +44,7 @@ import subprocess
 import shutil
 import gc
 import time
+import platform
 from pathlib import Path
 import logging
 from typing import Optional, List, Dict, Any
@@ -93,6 +94,12 @@ class PipelineConfig:
     sam_model: str = ""
     depth_model: str = ""
 
+    # DA3 Depth Sensitivity Settings (NEW)
+    depth_process_res: int = None         # None = auto, or explicit value like 1024, 2048
+    depth_process_method: str = "upper"   # "upper" or "lower" bound resize
+    depth_norm_percentiles: tuple = (2.0, 98.0)  # Normalization percentiles
+    use_depth_confidence: bool = False     # Use DA3 confidence maps
+
     # Edge refinement
     edge_softness: float = 1.0
     core_shrink: int = 3
@@ -108,6 +115,8 @@ class PipelineConfig:
 
     # Performance
     device: str = "cuda"
+    no_compile: bool = False
+    force_compile: bool = False  # Force torch.compile even on unsupported platforms
 
     # Debug
     verbose: bool = False
@@ -122,27 +131,54 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             'depth_model': 'small',
             'temporal_window': 3,
             'edge_softness': 0.5,
+            # DA3 settings: fast, basic detail
+            'depth_process_res': None,  # auto (image size)
+            'depth_process_method': 'upper',
+            'depth_norm_percentiles': (2.0, 98.0),
         },
         'standard': {
             'sam_model': 'base_plus',
             'depth_model': 'base',
             'temporal_window': 5,
             'edge_softness': 1.0,
+            # DA3 settings: balanced
+            'depth_process_res': None,  # auto
+            'depth_process_method': 'upper',
+            'depth_norm_percentiles': (2.0, 98.0),
         },
         'high': {
             'sam_model': 'large',
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 7,
             'edge_softness': 1.5,
+            # DA3 settings: optimized for fine detail
+            'depth_process_res': None,  # auto (but lower_bound gives higher effective res)
+            'depth_process_method': 'lower',  # Higher effective resolution for hair
+            'depth_norm_percentiles': (1.0, 99.0),  # Wider range preserves more detail
         },
         'ultra': {
             'sam_model': 'large',
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 9,
             'edge_softness': 2.0,
+            # DA3 settings: maximum detail capture
+            'depth_process_res': 2048,  # Explicit high resolution
+            'depth_process_method': 'lower',  # process_res is min dimension
+            'depth_norm_percentiles': (0.5, 99.5),  # Widest range for subtle details
         }
     }
     return presets.get(quality, presets['standard'])
+
+
+def should_disable_compile() -> bool:
+    """Check if torch.compile should be disabled by default.
+
+    torch.compile has known issues on Windows (Dynamo/Inductor incompatibility).
+    Returns True if running on Windows.
+    """
+    if platform.system() == "Windows":
+        return True
+    return False
 
 
 def find_script(name: str) -> Path:
@@ -223,6 +259,18 @@ def run_pipeline(config: PipelineConfig):
         config.temporal_window = preset['temporal_window']
     if config.edge_softness == 1.0:  # Default
         config.edge_softness = preset['edge_softness']
+    # Apply DA3 depth sensitivity settings from preset (unless overridden)
+    if config.depth_process_res is None and 'depth_process_res' in preset:
+        config.depth_process_res = preset['depth_process_res']
+    if config.depth_process_method == "upper" and 'depth_process_method' in preset:
+        config.depth_process_method = preset['depth_process_method']
+    if config.depth_norm_percentiles == (2.0, 98.0) and 'depth_norm_percentiles' in preset:
+        config.depth_norm_percentiles = preset['depth_norm_percentiles']
+
+    # Auto-disable torch.compile on Windows unless forced
+    if not config.no_compile and not config.force_compile and should_disable_compile():
+        logger.info("Windows detected - disabling torch.compile (use --force-compile to override)")
+        config.no_compile = True
 
     # Setup directories
     output_dir = Path(config.output_dir)
@@ -271,8 +319,11 @@ def run_pipeline(config: PipelineConfig):
             sam_args.extend(["--prompt", config.prompt])
         elif config.box:
             sam_args.extend(["--box", config.box])
-        elif config.interactive:
+        if config.interactive:
             sam_args.append("--interactive")
+
+        if config.no_compile:
+            sam_args.append("--no-compile")
 
         if config.verbose:
             sam_args.append("--verbose")
@@ -309,7 +360,19 @@ def run_pipeline(config: PipelineConfig):
             "--depth-model", config.depth_model,
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
+            # DA3 sensitivity settings
+            "--depth-method", config.depth_process_method,
+            "--depth-percentiles", str(config.depth_norm_percentiles[0]),
+            str(config.depth_norm_percentiles[1]),
         ]
+
+        # Add optional depth_process_res if explicitly set
+        if config.depth_process_res is not None:
+            depth_args.extend(["--depth-res", str(config.depth_process_res)])
+
+        # Add confidence flag if enabled
+        if config.use_depth_confidence:
+            depth_args.append("--use-depth-confidence")
 
         if config.verbose:
             depth_args.extend(["--verbose", "--debug"])
@@ -668,7 +731,20 @@ QUALITY PRESETS:
                        help="Override SAM2 model size")
     parser.add_argument("--depth-model",
                        choices=["small", "base", "large", "nested-base", "nested-large"],
-                       help="Override Depth model (nested-large best for hair detail)")
+                       help="Override Depth model (large=DA3Mono best for hair detail)")
+
+    # DA3 Depth Sensitivity Settings (NEW)
+    parser.add_argument("--depth-res", type=int, default=None,
+                       help="DA3 processing resolution (default: auto). "
+                            "Higher values (1024, 2048) capture finer hair details")
+    parser.add_argument("--depth-method", type=str, default="upper",
+                       choices=["upper", "lower"],
+                       help="DA3 resize method: 'lower' gives higher effective resolution")
+    parser.add_argument("--depth-percentiles", type=float, nargs=2, default=[2.0, 98.0],
+                       metavar=("LOW", "HIGH"),
+                       help="Depth normalization percentiles. Wider (1 99) preserves more detail")
+    parser.add_argument("--use-depth-confidence", action="store_true",
+                       help="Use DA3 confidence maps for semi-transparent edges")
 
     # ViTMatte settings (adaptive trimap)
     parser.add_argument("--vitmatte-motion", action="store_true",
@@ -697,6 +773,13 @@ QUALITY PRESETS:
                        choices=["exr", "png", "tiff"])
     parser.add_argument("--bit-depth", type=int, default=16,
                        choices=[8, 16, 32])
+
+    # Performance
+    parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--no-compile", action="store_true",
+                       help="Disable SAM2 model compilation (auto-enabled on Windows)")
+    parser.add_argument("--force-compile", action="store_true",
+                       help="Force torch.compile even on Windows (may fail)")
 
     # Debug
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -727,6 +810,12 @@ def main():
         skip_hair=not args.with_hair,
         sam_model=args.sam_model or "",
         depth_model=args.depth_model or "",
+        # DA3 depth sensitivity settings
+        depth_process_res=args.depth_res,
+        depth_process_method=args.depth_method,
+        depth_norm_percentiles=tuple(args.depth_percentiles),
+        use_depth_confidence=args.use_depth_confidence,
+        # ViTMatte settings
         vitmatte_motion_aware=args.vitmatte_motion,
         vitmatte_adaptive_base=args.vitmatte_base,
         vitmatte_adaptive_max=args.vitmatte_max,
@@ -737,6 +826,9 @@ def main():
         keyframe_interval=args.keyframe_interval,
         output_format=args.format,
         bit_depth=args.bit_depth,
+        device=args.device,
+        no_compile=args.no_compile,
+        force_compile=args.force_compile,
         verbose=args.verbose,
         keep_intermediate=args.keep_intermediate,
     )
