@@ -274,9 +274,10 @@ def run_pipeline(config: PipelineConfig):
     if config.depth_norm_percentiles == (2.0, 98.0) and 'depth_norm_percentiles' in preset:
         config.depth_norm_percentiles = preset['depth_norm_percentiles']
 
-    # Auto-disable torch.compile on Windows unless forced
+    # Auto-disable torch.compile on Windows without triton
     if not config.no_compile and not config.force_compile and should_disable_compile():
-        logger.info("Windows detected - disabling torch.compile (use --force-compile to override)")
+        logger.info("Windows without triton - disabling torch.compile")
+        logger.info("  Install triton-windows for compilation: pip install triton-windows>=3.3")
         config.no_compile = True
 
     # Setup directories

@@ -14,6 +14,7 @@ Usage:
 
 import argparse
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -129,14 +130,21 @@ def main():
 
     print("=" * 60)
 
-    # Set environment to disable torch.compile (Windows compatibility)
+    # Set environment - only disable torch.compile on Windows without triton
     env = os.environ.copy()
-    env["TORCHDYNAMO_DISABLE"] = "1"
+    if platform.system() == "Windows":
+        try:
+            import triton
+            print(f"Windows with triton {triton.__version__} - torch.compile enabled")
+        except ImportError:
+            print("Windows without triton - disabling torch.compile")
+            env["TORCHDYNAMO_DISABLE"] = "1"
 
     if args.dry_run:
         print("\nDry run - would execute:")
         print(" ".join(cmd))
-        print(f"\nWith TORCHDYNAMO_DISABLE=1")
+        if "TORCHDYNAMO_DISABLE" in env:
+            print("\nWith TORCHDYNAMO_DISABLE=1")
         return 0
 
     print("\nStarting pipeline...\n")
