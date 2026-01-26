@@ -173,11 +173,18 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
 def should_disable_compile() -> bool:
     """Check if torch.compile should be disabled by default.
 
-    torch.compile has known issues on Windows (Dynamo/Inductor incompatibility).
-    Returns True if running on Windows.
+    torch.compile requires triton on Windows. With PyTorch 2.7+ and
+    triton-windows 3.3+, torch.compile works correctly.
+    Returns True only if on Windows without triton.
     """
     if platform.system() == "Windows":
-        return True
+        try:
+            import triton
+            # triton-windows available - torch.compile should work
+            return False
+        except ImportError:
+            # No triton on Windows - disable compile
+            return True
     return False
 
 
