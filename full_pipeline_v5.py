@@ -73,6 +73,9 @@ class PipelineConfig:
     box: str = ""
     interactive: bool = False
 
+    # SAM version selection
+    use_sam3: bool = False  # Use SAM3 with built-in text prompting (no Grounding DINO)
+
     # Quality preset
     quality: str = "standard"  # draft, standard, high, ultra
 
@@ -246,6 +249,115 @@ def run_python_stage(
     return run_stage(cmd, stage_name, verbose)
 
 
+def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
+    """
+    Run SAM3 segmentation with built-in text prompting.
+
+    SAM3 doesn't need Grounding DINO - it has native text understanding.
+
+    Args:
+        config: Pipeline configuration
+        output_dir: Output directory for SAM3 results
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import cv2
+    import numpy as np
+
+    logger.info("\n" + "="*60)
+    logger.info("STAGE: SAM3 Segmentation (Built-in Text Prompting)")
+    logger.info("="*60)
+
+    start_time = time.time()
+
+    try:
+        # Import SAM3 from auto_roto
+        sys.path.insert(0, str(Path(__file__).parent))
+        from auto_roto import SAM3Segmenter, VideoReader, FrameWriter
+
+        # Create output directories
+        output_dir.mkdir(parents=True, exist_ok=True)
+        alpha_dir = output_dir / "alpha"
+        preview_dir = output_dir / "preview"
+        alpha_dir.mkdir(exist_ok=True)
+        preview_dir.mkdir(exist_ok=True)
+
+        # Parse text prompts (support multiple via "." separator like SAM2 mode)
+        text_prompts = config.prompt.split(".") if config.prompt else ["person"]
+        logger.info(f"Text prompts: {text_prompts}")
+
+        # Initialize SAM3
+        sam3 = SAM3Segmenter(
+            model_path="sam3.pt",
+            device=config.device,
+            logger=logger
+        )
+
+        # Setup frame writer
+        writer = FrameWriter(
+            output_dir=str(output_dir),
+            prefix="roto",
+            format=config.output_format,
+            bit_depth=config.bit_depth,
+            padding=4,
+            logger=logger
+        )
+
+        # Check if input is video or frames directory
+        input_path = Path(config.input_path)
+
+        if input_path.is_file():
+            # Process video file with SAM3 video predictor
+            logger.info(f"Processing video: {input_path}")
+
+            frame_idx = 0
+            for idx, mask in sam3.segment_video_with_text(str(input_path), text_prompts):
+                if mask is not None:
+                    # Write alpha
+                    writer.write_alpha(mask, idx)
+                    frame_idx = idx
+
+            logger.info(f"Processed {frame_idx + 1} frames")
+
+        elif input_path.is_dir():
+            # Process frames directory
+            logger.info(f"Processing frames directory: {input_path}")
+
+            for idx, mask in sam3.segment_frames_with_text(str(input_path), text_prompts):
+                if mask is not None:
+                    writer.write_alpha(mask, idx)
+
+        else:
+            # Try as video reader (handles sequences)
+            reader = VideoReader(str(input_path), logger)
+            frames = list(reader)
+
+            for idx, frame in enumerate(frames):
+                masks = sam3.segment_image_with_text(frame, text_prompts)
+                if masks:
+                    combined = np.zeros(frame.shape[:2], dtype=np.float32)
+                    for m in masks:
+                        combined = np.maximum(combined, m.astype(np.float32))
+                    writer.write_alpha(combined, idx)
+
+                if idx % 10 == 0:
+                    logger.info(f"  Frame {idx}/{len(frames)}")
+
+        # Cleanup
+        sam3.release()
+
+        duration = time.time() - start_time
+        logger.info(f"  SAM3 Segmentation completed in {duration:.1f}s")
+        return True
+
+    except Exception as e:
+        logger.error(f"SAM3 stage failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def run_pipeline(config: PipelineConfig):
     """Run the full v5 pipeline."""
 
@@ -296,50 +408,58 @@ def run_pipeline(config: PipelineConfig):
     logger.info(f"Input: {config.input_path}")
     logger.info(f"Output: {config.output_dir}")
     logger.info(f"Quality: {config.quality}")
-    logger.info(f"SAM Model: {config.sam_model}")
+    if config.use_sam3:
+        logger.info("SAM Mode: SAM3 (built-in text prompting, no Grounding DINO)")
+    else:
+        logger.info(f"SAM Model: {config.sam_model} (SAM2 + Grounding DINO)")
     logger.info(f"Depth Model: {config.depth_model}")
     logger.info("="*60)
 
     # =========================================================================
-    # STAGE 1: SAM2 Segmentation
+    # STAGE 1: SAM Segmentation (SAM2 or SAM3)
     # =========================================================================
     if not config.skip_sam:
-        auto_roto_script = find_script("auto_roto.py")
+        if config.use_sam3:
+            # Use SAM3 with built-in text prompting
+            success = run_sam3_stage(config, sam_output)
+        else:
+            # Use SAM2 with Grounding DINO
+            auto_roto_script = find_script("auto_roto.py")
 
-        sam_args = [
-            "--input", config.input_path,
-            "--output", str(sam_output),
-            "--sam-model", config.sam_model,
-            "--format", config.output_format,
-            "--bit-depth", str(config.bit_depth),
-            "--no-refine",  # We'll do our own refinement
-        ]
+            sam_args = [
+                "--input", config.input_path,
+                "--output", str(sam_output),
+                "--sam-model", config.sam_model,
+                "--format", config.output_format,
+                "--bit-depth", str(config.bit_depth),
+                "--no-refine",  # We'll do our own refinement
+            ]
 
-        if config.prompt:
-            sam_args.extend(["--prompt", config.prompt])
-        elif config.box:
-            sam_args.extend(["--box", config.box])
-        if config.interactive:
-            sam_args.append("--interactive")
+            if config.prompt:
+                sam_args.extend(["--prompt", config.prompt])
+            elif config.box:
+                sam_args.extend(["--box", config.box])
+            if config.interactive:
+                sam_args.append("--interactive")
 
-        if config.no_compile:
-            sam_args.append("--no-compile")
+            if config.no_compile:
+                sam_args.append("--no-compile")
 
-        if config.verbose:
-            sam_args.append("--verbose")
+            if config.verbose:
+                sam_args.append("--verbose")
 
-        success = run_python_stage(
-            auto_roto_script, sam_args,
-            "SAM2 Segmentation", config.verbose
-        )
+            success = run_python_stage(
+                auto_roto_script, sam_args,
+                "SAM2 Segmentation", config.verbose
+            )
 
         if not success:
-            logger.error("Pipeline failed at SAM2 stage")
+            logger.error("Pipeline failed at SAM stage")
             return False
 
         clear_gpu_memory()
     else:
-        logger.info("Skipping SAM2 (--skip-sam)")
+        logger.info("Skipping SAM (--skip-sam)")
 
     # =========================================================================
     # STAGE 2: Depth Refinement
@@ -709,6 +829,11 @@ QUALITY PRESETS:
                        default="standard",
                        help="Quality preset (default: standard)")
 
+    # SAM3 mode (no Grounding DINO needed)
+    parser.add_argument("--use-sam3", action="store_true",
+                       help="Use SAM3 with built-in text prompting (no Grounding DINO needed). "
+                            "Requires ultralytics>=8.3.237 and sam3.pt checkpoint.")
+
     # Stage control
     parser.add_argument("--skip-sam", action="store_true",
                        help="Skip SAM2 (use existing alpha)")
@@ -800,6 +925,7 @@ def main():
         prompt=args.prompt or "",
         box=args.box or "",
         interactive=args.interactive,
+        use_sam3=args.use_sam3,
         quality=args.quality,
         skip_sam=args.skip_sam,
         skip_depth=args.skip_depth,
