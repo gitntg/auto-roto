@@ -393,8 +393,8 @@ class DepthEstimator:
     def estimate_high_res(
         self,
         image: np.ndarray,
-        tile_size: int = 1024,
-        overlap: int = 256,
+        tile_size: int = None,
+        overlap: int = None,
         mask: np.ndarray = None
     ) -> np.ndarray:
         """
@@ -405,8 +405,8 @@ class DepthEstimator:
 
         Args:
             image: RGB image (H, W, 3), uint8
-            tile_size: Size of each tile for non-nested models (default 1024)
-            overlap: Overlap between tiles for blending (default 256)
+            tile_size: Size of each tile (default: 2048, or process_res if set)
+            overlap: Overlap between tiles for blending (default: tile_size // 4)
             mask: Optional alpha mask - prioritize tiles overlapping mask edges
 
         Returns:
@@ -419,6 +419,19 @@ class DepthEstimator:
             image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
 
         h, w = image.shape[:2]
+
+        # Determine tile size based on process_res setting or default to 2048
+        # Larger tiles = better quality but more VRAM
+        if tile_size is None:
+            if self.process_res is not None and self.process_res >= 1024:
+                tile_size = min(self.process_res, 2048)  # Use process_res but cap at 2048
+            else:
+                tile_size = 2048  # Default to 2048 for better quality
+
+        if overlap is None:
+            overlap = tile_size // 4  # 25% overlap for smooth blending
+
+        self.logger.debug(f"High-res depth: tile_size={tile_size}, overlap={overlap}, image={w}x{h}")
 
         # Tiled processing for memory efficiency on large images
         # If image is smaller than tile size, just use regular estimation

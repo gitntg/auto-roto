@@ -3,47 +3,44 @@
 AUTO-ROTO: Production-Grade Automatic Rotoscoping Pipeline
 ===========================================================
 
-Combines SAM2 (video segmentation) + GroundingDINO (text detection) + Alpha Refinement
-for bulletproof automatic rotoscoping that generates perfect alphas from complex clips.
+Uses SAM3 (Segment Anything Model 3) with built-in text prompting for
+bulletproof automatic rotoscoping that generates perfect alphas from complex clips.
+
+SAM3 has native Promptable Concept Segmentation (PCS) supporting 270k+ concepts,
+eliminating the need for separate detection (GroundingDINO).
 
 Author: Built for Core Form VFX
 License: MIT
 
 ARCHITECTURE:
     Input Video/Sequence
-           |
+           │
            v
     ┌─────────────────┐
     │ Frame Extraction │
     └────────┬────────┘
              │
              v
-    ┌─────────────────┐     ┌──────────────────┐
-    │  GroundingDINO  │ OR  │  Interactive     │
-    │  (text prompt)  │     │  (point/box)     │
-    └────────┬────────┘     └────────┬─────────┘
-             │                       │
-             └───────────┬───────────┘
-                         v
-              ┌─────────────────┐
-              │     SAM 2.1     │
-              │ (video predict) │
-              └────────┬────────┘
-                       │
-                       v
-              ┌─────────────────┐
-              │ Alpha Refinement│
-              │ (edge matting)  │
-              └────────┬────────┘
-                       │
-                       v
-              ┌─────────────────┐
-              │  EXR Export     │
-              │  (16-bit float) │
-              └─────────────────┘
+    ┌─────────────────────────┐
+    │         SAM3            │
+    │  (unified text/box/     │
+    │   point prompting)      │
+    └────────┬────────────────┘
+             │
+             v
+    ┌─────────────────┐
+    │ Alpha Refinement│
+    │ (edge matting)  │
+    └────────┬────────┘
+             │
+             v
+    ┌─────────────────┐
+    │  EXR Export     │
+    │  (16-bit float) │
+    └─────────────────┘
 
 USAGE:
-    # Text-based detection (automatic)
+    # Text-based detection (SAM3 native - no GroundingDINO needed)
     python auto_roto.py --input video.mp4 --prompt "person" --output ./output
 
     # Interactive mode (click to select)
@@ -54,6 +51,10 @@ USAGE:
 
     # Multiple objects
     python auto_roto.py --input video.mp4 --prompt "person.dog.car" --output ./output
+
+REQUIREMENTS:
+    - ultralytics >= 8.3.237
+    - sam3.pt checkpoint (place in checkpoints/sam3/ or working directory)
 """
 
 import os
@@ -67,6 +68,26 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 import time
+
+# Environment verification - ensures correct conda environment
+REQUIRED_ENV = "autoroto"
+
+def _check_conda_environment():
+    """Verify we're running in the correct conda environment."""
+    current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    if current_env != REQUIRED_ENV:
+        print("\n" + "="*60)
+        print("WRONG CONDA ENVIRONMENT")
+        print("="*60)
+        print(f"\n  Current environment: {current_env or '(none/base)'}")
+        print(f"  Required environment: {REQUIRED_ENV}")
+        print(f"\n  Please activate the correct environment:")
+        print(f"    conda activate {REQUIRED_ENV}")
+        print("\n" + "="*60)
+        sys.exit(1)
+
+# Run environment check immediately on import
+_check_conda_environment()
 
 # Lazy imports for faster startup and better error messages
 def _check_dependencies():
@@ -104,43 +125,44 @@ def _check_dependencies():
 
 @dataclass
 class RotoConfig:
-    """Configuration for the auto-roto pipeline."""
-    
+    """Configuration for the auto-roto pipeline using SAM3."""
+
     # Input/Output
     input_path: str = ""
     output_dir: str = "./output"
-    
+
     # Detection mode
-    prompt: Optional[str] = None  # Text prompt for GroundingDINO
+    prompt: Optional[str] = None  # Text prompt (SAM3 has built-in text prompting)
     box: Optional[str] = None     # Box prompt "x1,y1,x2,y2"
     point: Optional[str] = None   # Point prompt "x,y"
     interactive: bool = False     # Interactive selection mode
-    
-    # SAM2 settings
-    sam_model: str = "large"      # tiny, small, base_plus, large
+
+    # SAM3 settings (single model, no size choices like SAM2)
     propagate_forward: bool = True
     propagate_backward: bool = True
-    
-    # GroundingDINO settings
-    detection_threshold: float = 0.3
-    text_threshold: float = 0.25
-    
+
+    # SAM3 inference settings
+    sam_imgsz: int = 0              # Processing resolution (0 = auto from input, max 8192)
+    sam_conf: float = 0.25          # Confidence threshold (0.0-1.0, lower = more detections)
+    sam_retina_masks: bool = True   # High-resolution mask output
+    sam_max_det: int = 100          # Maximum detections per frame
+
     # Alpha refinement
     refine_alpha: bool = True
     refine_iterations: int = 3
     edge_softness: float = 1.0
-    
+
     # Output settings
     output_format: str = "exr"    # exr, png, tiff
     bit_depth: int = 16           # 8, 16, 32
     include_rgb: bool = True      # Include RGB in output
     frame_padding: int = 4        # Frame number padding (####)
-    
+
     # Performance
     device: str = "cuda"
     batch_size: int = 1
     compile_model: bool = True    # Use torch.compile for speed
-    
+
     # Debug
     verbose: bool = False
     save_preview: bool = True
@@ -819,240 +841,6 @@ class AlphaRefiner:
 
 
 # ==============================================================================
-# SAM2 WRAPPER
-# ==============================================================================
-
-class SAM2Segmenter:
-    """
-    Wrapper for SAM2 video segmentation.
-    
-    Features:
-        - Temporal consistency via memory bank
-        - Multi-object tracking
-        - Point, box, and mask prompts
-    """
-    
-    MODEL_CONFIGS = {
-        'tiny': ('sam2.1_hiera_tiny.pt', 'configs/sam2.1/sam2.1_hiera_t.yaml'),
-        'small': ('sam2.1_hiera_small.pt', 'configs/sam2.1/sam2.1_hiera_s.yaml'),
-        'base_plus': ('sam2.1_hiera_base_plus.pt', 'configs/sam2.1/sam2.1_hiera_b+.yaml'),
-        'large': ('sam2.1_hiera_large.pt', 'configs/sam2.1/sam2.1_hiera_l.yaml'),
-    }
-    
-    CHECKPOINT_URLS = {
-        'tiny': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt',
-        'small': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt',
-        'base_plus': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt',
-        'large': 'https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt',
-    }
-    
-    def __init__(
-        self,
-        model_size: str = 'large',
-        device: str = 'cuda',
-        compile_model: bool = True,
-        logger: logging.Logger = None
-    ):
-        self.model_size = model_size
-        self.device = device
-        self.logger = logger or logging.getLogger("SAM2")
-
-        # Auto-disable compile on Windows (torch.compile has known issues)
-        if compile_model and platform.system() == "Windows":
-            self.logger.info("Windows detected - disabling torch.compile for SAM2")
-            compile_model = False
-
-        self.compile_model = compile_model
-
-        self.predictor = None
-        self.state = None
-
-        self._load_model()
-    
-    def _load_model(self):
-        """Load SAM2 model."""
-        import torch
-        
-        self.logger.info(f"Loading SAM2 {self.model_size} model...")
-        
-        try:
-            from sam2.build_sam import build_sam2_video_predictor
-        except ImportError:
-            self.logger.error(
-                "SAM2 not installed. Install with:\n"
-                "  git clone https://github.com/facebookresearch/sam2.git\n"
-                "  cd sam2 && pip install -e ."
-            )
-            raise
-        
-        checkpoint, config = self.MODEL_CONFIGS[self.model_size]
-
-        # Check if checkpoint exists, download if not
-        checkpoint_path = self._ensure_checkpoint(checkpoint)
-
-        # Hydra expects relative config name, not absolute path
-        # The config is searched in sam2's package config search path
-        self.predictor = build_sam2_video_predictor(
-            config,  # Just the relative config name like "configs/sam2.1/sam2.1_hiera_s.yaml"
-            str(checkpoint_path),
-            device=self.device,
-            vos_optimized=self.compile_model
-        )
-        
-        self.logger.info("SAM2 model loaded successfully")
-    
-    def _ensure_checkpoint(self, checkpoint: str) -> Path:
-        """Ensure checkpoint exists, download if needed."""
-        import urllib.request
-        
-        # Check common locations
-        possible_paths = [
-            Path(checkpoint),
-            Path("checkpoints") / checkpoint,
-            Path.home() / ".cache" / "sam2" / checkpoint,
-        ]
-        
-        for p in possible_paths:
-            if p.exists():
-                return p
-        
-        # Download
-        cache_dir = Path.home() / ".cache" / "sam2"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        target_path = cache_dir / checkpoint
-        url = self.CHECKPOINT_URLS[self.model_size]
-        
-        self.logger.info(f"Downloading {checkpoint}...")
-        urllib.request.urlretrieve(url, target_path)
-        self.logger.info("Download complete")
-        
-        return target_path
-    
-    def init_video(self, frames_dir: str):
-        """Initialize video state from frames directory."""
-        import torch
-        
-        with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
-            self.state = self.predictor.init_state(frames_dir)
-    
-    def add_point_prompt(
-        self,
-        frame_idx: int,
-        points: List[Tuple[int, int]],
-        labels: List[int],
-        object_id: int = 1
-    ):
-        """
-        Add point prompt(s) to a frame.
-        
-        Args:
-            frame_idx: Frame to add prompt to
-            points: List of (x, y) coordinates
-            labels: List of labels (1 = foreground, 0 = background)
-            object_id: ID for this object
-        """
-        import torch
-        import numpy as np
-        
-        points_np = np.array(points, dtype=np.float32)
-        labels_np = np.array(labels, dtype=np.int32)
-        
-        with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
-            _, _, masks = self.predictor.add_new_points_or_box(
-                self.state,
-                frame_idx=frame_idx,
-                obj_id=object_id,
-                points=points_np,
-                labels=labels_np,
-            )
-        
-        return masks
-    
-    def add_box_prompt(
-        self,
-        frame_idx: int,
-        box: Tuple[int, int, int, int],
-        object_id: int = 1
-    ):
-        """
-        Add box prompt to a frame.
-        
-        Args:
-            frame_idx: Frame to add prompt to
-            box: (x1, y1, x2, y2) coordinates
-            object_id: ID for this object
-        """
-        import torch
-        import numpy as np
-        
-        box_np = np.array(box, dtype=np.float32)
-        
-        with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
-            _, _, masks = self.predictor.add_new_points_or_box(
-                self.state,
-                frame_idx=frame_idx,
-                obj_id=object_id,
-                box=box_np,
-            )
-        
-        return masks
-    
-    def propagate(self, reverse: bool = False):
-        """
-        Propagate masks through video.
-        
-        Yields:
-            (frame_idx, object_ids, masks) tuples
-        """
-        import torch
-        
-        with torch.inference_mode(), torch.autocast(self.device, dtype=torch.bfloat16):
-            for frame_idx, object_ids, masks in self.predictor.propagate_in_video(
-                self.state,
-                reverse=reverse
-            ):
-                # Convert masks to numpy
-                masks_np = masks.cpu().numpy()
-                yield frame_idx, object_ids, masks_np
-
-    def release(self) -> None:
-        """Release model and free GPU memory."""
-        try:
-            if self.predictor is not None:
-                del self.predictor
-                self.predictor = None
-            
-            if self.state is not None:
-                del self.state
-                self.state = None
-            
-            self.logger.debug("SAM2Segmenter model released")
-            
-            import torch
-            import gc
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            gc.collect()
-        except Exception:
-            pass
-
-    def __del__(self):
-        """Destructor to ensure cleanup."""
-        self.release()
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit with cleanup."""
-        self.release()
-        return False
-
-
-# ==============================================================================
 # SAM3 WRAPPER (Ultralytics - with built-in text prompting)
 # ==============================================================================
 
@@ -1080,13 +868,25 @@ class SAM3Segmenter:
         device: str = "cuda",
         compile_model: bool = True,
         half_precision: bool = True,
-        logger: logging.Logger = None
+        logger: logging.Logger = None,
+        # Inference settings
+        imgsz: int = 1024,
+        conf: float = 0.25,
+        retina_masks: bool = True,
+        max_det: int = 100
     ):
         self.model_path = model_path
         self.device = device
         self.compile_model = compile_model
         self.half_precision = half_precision
         self.logger = logger or logging.getLogger("SAM3")
+
+        # Inference settings
+        self._imgsz_setting = imgsz  # 0 = auto
+        self._resolved_imgsz = None  # Will be set based on first image
+        self.conf = conf
+        self.retina_masks = retina_masks
+        self.max_det = max_det
 
         # Predictors (lazy loaded)
         self._image_predictor = None
@@ -1095,12 +895,48 @@ class SAM3Segmenter:
         # Check if sam3.pt exists
         self._verify_checkpoint()
 
+    def _resolve_imgsz(self, image_shape: tuple) -> int:
+        """
+        Resolve imgsz from image dimensions.
+
+        Args:
+            image_shape: (H, W, C) or (H, W) tuple
+
+        Returns:
+            Resolved imgsz (max dimension, with practical GPU memory limits)
+        """
+        if self._imgsz_setting > 0:
+            return self._imgsz_setting
+
+        # Auto mode: use larger dimension with practical limits
+        # SAM3 attention layers scale quadratically with image size
+        # Practical limits based on VRAM:
+        #   - 8GB VRAM:  ~1024 max
+        #   - 12GB VRAM: ~1536 max
+        #   - 24GB VRAM: ~2048 max
+        #   - 48GB VRAM: ~3072 max
+        # Default cap at 2048 for RTX 4090 class GPUs
+        MAX_AUTO_IMGSZ = 2048
+
+        h, w = image_shape[:2]
+        max_dim = max(h, w)
+        resolved = min(max_dim, MAX_AUTO_IMGSZ)
+
+        self.logger.info(f"Auto imgsz: input={w}x{h}, using imgsz={resolved} (max={MAX_AUTO_IMGSZ})")
+        return resolved
+
+    @property
+    def imgsz(self) -> int:
+        """Get resolved imgsz (may be 0 if not yet resolved)."""
+        return self._resolved_imgsz if self._resolved_imgsz else self._imgsz_setting
+
     def _verify_checkpoint(self):
         """Verify SAM3 checkpoint exists."""
         from pathlib import Path
 
         possible_paths = [
             Path(self.model_path),
+            Path("checkpoints/sam3") / Path(self.model_path).name,  # NEW: checkpoints/sam3/sam3.pt
             Path("checkpoints") / self.model_path,
             Path.home() / ".cache" / "sam3" / self.model_path,
         ]
@@ -1116,7 +952,7 @@ class SAM3Segmenter:
             "Download from HuggingFace (requires approval):\n"
             "  1. Request access at https://huggingface.co/facebook/sam3\n"
             "  2. Download sam3.pt after approval\n"
-            "  3. Place in working directory or checkpoints/"
+            "  3. Place in working directory or checkpoints/sam3/"
         )
 
     @property
@@ -1124,11 +960,15 @@ class SAM3Segmenter:
         """Lazy-load image predictor."""
         if self._image_predictor is None:
             self.logger.info("Loading SAM3 image predictor...")
+            self.logger.info(f"  imgsz={self.imgsz}, conf={self.conf}, retina_masks={self.retina_masks}")
             try:
                 from ultralytics.models.sam import SAM3SemanticPredictor
 
                 overrides = dict(
-                    conf=0.25,
+                    conf=self.conf,
+                    imgsz=self.imgsz,
+                    retina_masks=self.retina_masks,
+                    max_det=self.max_det,
                     task="segment",
                     mode="predict",
                     model=self.model_path,
@@ -1149,11 +989,15 @@ class SAM3Segmenter:
         """Lazy-load video predictor."""
         if self._video_predictor is None:
             self.logger.info("Loading SAM3 video predictor...")
+            self.logger.info(f"  imgsz={self.imgsz}, conf={self.conf}, retina_masks={self.retina_masks}")
             try:
                 from ultralytics.models.sam import SAM3VideoSemanticPredictor
 
                 overrides = dict(
-                    conf=0.25,
+                    conf=self.conf,
+                    imgsz=self.imgsz,
+                    retina_masks=self.retina_masks,
+                    max_det=self.max_det,
                     task="segment",
                     mode="predict",
                     model=self.model_path,
@@ -1189,10 +1033,14 @@ class SAM3Segmenter:
 
         self.logger.info(f"Segmenting with text prompts: {text_prompts}")
 
+        # Resolve imgsz from image dimensions (before predictor init)
+        if self._resolved_imgsz is None:
+            self._resolved_imgsz = self._resolve_imgsz(image.shape)
+
         # Set image
         self.image_predictor.set_image(image)
 
-        # Run prediction
+        # Run prediction (settings already configured in predictor)
         results = self.image_predictor(text=text_prompts)
 
         # Extract masks
@@ -1204,6 +1052,137 @@ class SAM3Segmenter:
 
         self.logger.info(f"Found {len(masks)} masks")
         return masks
+
+    def segment_image_with_box(
+        self,
+        image: 'np.ndarray',
+        boxes: List[Tuple[int, int, int, int]]
+    ) -> List['np.ndarray']:
+        """
+        Segment image using bounding box prompts.
+
+        Args:
+            image: RGB image (numpy array)
+            boxes: List of bounding boxes as (x1, y1, x2, y2)
+
+        Returns:
+            List of binary masks for each box
+        """
+        import numpy as np
+
+        self.logger.info(f"Segmenting with {len(boxes)} box prompts")
+
+        # Set image
+        self.image_predictor.set_image(image)
+
+        # Convert boxes to numpy array
+        bboxes = np.array(boxes, dtype=np.float32)
+
+        # Run prediction with bboxes
+        results = self.image_predictor(bboxes=bboxes)
+
+        # Extract masks
+        masks = []
+        for result in results:
+            if result.masks is not None:
+                for mask in result.masks.data:
+                    masks.append(mask.cpu().numpy())
+
+        self.logger.info(f"Found {len(masks)} masks from box prompts")
+        return masks
+
+    def segment_image_with_points(
+        self,
+        image: 'np.ndarray',
+        points: List[Tuple[int, int]],
+        labels: List[int]
+    ) -> List['np.ndarray']:
+        """
+        Segment image using point prompts.
+
+        Args:
+            image: RGB image (numpy array)
+            points: List of (x, y) coordinates
+            labels: List of labels (1 = foreground, 0 = background)
+
+        Returns:
+            List of binary masks
+        """
+        import numpy as np
+
+        self.logger.info(f"Segmenting with {len(points)} point prompts")
+
+        # Set image
+        self.image_predictor.set_image(image)
+
+        # Convert to numpy arrays
+        points_np = np.array(points, dtype=np.float32)
+        labels_np = np.array(labels, dtype=np.int32)
+
+        # Run prediction with points
+        results = self.image_predictor(points=points_np, labels=labels_np)
+
+        # Extract masks
+        masks = []
+        for result in results:
+            if result.masks is not None:
+                for mask in result.masks.data:
+                    masks.append(mask.cpu().numpy())
+
+        self.logger.info(f"Found {len(masks)} masks from point prompts")
+        return masks
+
+    def segment_video_with_box(
+        self,
+        video_path: str,
+        boxes: List[Tuple[int, int, int, int]],
+        output_masks: bool = True
+    ):
+        """
+        Segment video using bounding box prompts with temporal tracking.
+
+        Args:
+            video_path: Path to video file or frames directory
+            boxes: List of bounding boxes as (x1, y1, x2, y2)
+            output_masks: Whether to yield masks for each frame
+
+        Yields:
+            (frame_idx, masks) tuples
+        """
+        import numpy as np
+
+        self.logger.info(f"Processing video with box prompts: {video_path}")
+        self.logger.info(f"Boxes: {boxes}")
+
+        # Convert boxes to numpy array
+        bboxes = np.array(boxes, dtype=np.float32)
+
+        # Run video prediction with streaming
+        results = self.video_predictor(
+            source=video_path,
+            bboxes=bboxes,
+            stream=True
+        )
+
+        frame_idx = 0
+        for result in results:
+            if output_masks and result.masks is not None:
+                masks_data = result.masks.data.cpu().numpy()
+
+                if len(masks_data) > 0:
+                    combined = np.zeros(masks_data.shape[-2:], dtype=np.float32)
+                    for mask in masks_data:
+                        combined = np.maximum(combined, mask.astype(np.float32))
+                    yield frame_idx, combined
+                else:
+                    yield frame_idx, None
+            else:
+                yield frame_idx, None
+
+            frame_idx += 1
+
+            if frame_idx % 10 == 0:
+                self.logger.info(f"  Processed frame {frame_idx}")
 
     def segment_video_with_text(
         self,
@@ -1225,6 +1204,15 @@ class SAM3Segmenter:
             (frame_idx, masks) tuples where masks is a dict of concept->mask
         """
         import numpy as np
+        from pathlib import Path
+
+        path = Path(video_path)
+
+        # If it's a directory of frames, use frame-by-frame processing
+        if path.is_dir():
+            self.logger.info(f"Processing frames directory: {video_path}")
+            yield from self.segment_frames_with_text(video_path, text_prompts)
+            return
 
         self.logger.info(f"Processing video: {video_path}")
         self.logger.info(f"Text prompts: {text_prompts}")
@@ -1352,257 +1340,46 @@ class SAM3Segmenter:
 
 
 # ==============================================================================
-# GROUNDING DINO WRAPPER (Legacy - not needed with SAM3)
-# ==============================================================================
-
-class GroundingDINODetector:
-    """
-    Wrapper for GroundingDINO text-to-bbox detection.
-
-    LEGACY: This class is only needed when using SAM2. When using SAM3 with
-    --use-sam3 flag, text prompting is built-in and Grounding DINO is not required.
-
-    To migrate to SAM3:
-        1. Run: upgrade_to_sam3.bat (or pip install ultralytics>=8.3.237)
-        2. Download sam3.pt from HuggingFace
-        3. Use --use-sam3 flag instead of --prompt with Grounding DINO
-
-    This class remains for backwards compatibility with SAM2 workflows.
-    """
-    
-    def __init__(
-        self,
-        box_threshold: float = 0.3,
-        text_threshold: float = 0.25,
-        device: str = 'cuda',
-        logger: logging.Logger = None
-    ):
-        self.box_threshold = box_threshold
-        self.text_threshold = text_threshold
-        self.device = device
-        self.logger = logger or logging.getLogger("GroundingDINO")
-        
-        self.model = None
-        self._load_model()
-    
-    def _load_model(self):
-        """Load GroundingDINO model."""
-        self.logger.info("Loading GroundingDINO model...")
-        
-        try:
-            from groundingdino.util.inference import load_model, predict
-            self.predict_fn = predict
-            
-            # Load model
-            # Check for model files
-            config_path = self._find_config()
-            checkpoint_path = self._find_checkpoint()
-            
-            self.model = load_model(config_path, checkpoint_path, device=self.device)
-            self.logger.info("GroundingDINO loaded successfully")
-            
-        except ImportError:
-            self.logger.warning(
-                "GroundingDINO not installed. Text prompts won't be available.\n"
-                "Install with:\n"
-                "  git clone https://github.com/IDEA-Research/GroundingDINO.git\n"
-                "  cd GroundingDINO && pip install -e ."
-            )
-            self.model = None
-    
-    def _find_config(self) -> str:
-        """Find GroundingDINO config file."""
-        possible = [
-            "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py",
-            "groundingdino/config/GroundingDINO_SwinT_OGC.py",
-        ]
-        
-        for p in possible:
-            if Path(p).exists():
-                return p
-        
-        # Try to find in installed package
-        try:
-            import groundingdino
-            pkg_dir = Path(groundingdino.__file__).parent
-            config = pkg_dir / "config" / "GroundingDINO_SwinT_OGC.py"
-            if config.exists():
-                return str(config)
-        except:
-            pass
-        
-        raise FileNotFoundError("GroundingDINO config not found")
-    
-    def _find_checkpoint(self) -> str:
-        """Find or download GroundingDINO checkpoint."""
-        import urllib.request
-        
-        checkpoint_name = "groundingdino_swint_ogc.pth"
-        
-        possible = [
-            Path(checkpoint_name),
-            Path("weights") / checkpoint_name,
-            Path.home() / ".cache" / "groundingdino" / checkpoint_name,
-        ]
-        
-        for p in possible:
-            if p.exists():
-                return str(p)
-        
-        # Download
-        cache_dir = Path.home() / ".cache" / "groundingdino"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        target = cache_dir / checkpoint_name
-        url = "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth"
-        
-        self.logger.info(f"Downloading GroundingDINO checkpoint...")
-        urllib.request.urlretrieve(url, target)
-        
-        return str(target)
-    
-    def detect(
-        self,
-        image: 'np.ndarray',
-        prompt: str
-    ) -> List[Tuple[int, int, int, int]]:
-        """
-        Detect objects matching text prompt.
-        
-        Args:
-            image: RGB image (numpy array)
-            prompt: Text description of objects to find
-            
-        Returns:
-            List of bounding boxes (x1, y1, x2, y2)
-        """
-        if self.model is None:
-            raise RuntimeError("GroundingDINO not available")
-        
-        import torch
-        import numpy as np
-        from PIL import Image
-        import groundingdino.datasets.transforms as T
-
-        # Prepare image
-        transform = T.Compose([
-            T.RandomResize([800], max_size=1333),
-            T.ToTensor(),
-            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-        ])
-
-        # Convert 16-bit to 8-bit if needed
-        if image.dtype == np.uint16:
-            image = (image / 256).astype(np.uint8)
-        elif image.dtype in (np.float32, np.float64):
-            image = (image * 255).astype(np.uint8)
-
-        pil_image = Image.fromarray(image)
-        image_transformed, _ = transform(pil_image, None)
-        
-        # Run detection
-        boxes, logits, phrases = self.predict_fn(
-            self.model,
-            image_transformed,
-            prompt,
-            self.box_threshold,
-            self.text_threshold,
-            device=self.device
-        )
-        
-        # Convert normalized boxes to pixel coordinates
-        h, w = image.shape[:2]
-        boxes_pixel = []
-        
-        for box in boxes:
-            cx, cy, bw, bh = box.tolist()
-            x1 = int((cx - bw/2) * w)
-            y1 = int((cy - bh/2) * h)
-            x2 = int((cx + bw/2) * w)
-            y2 = int((cy + bh/2) * h)
-            boxes_pixel.append((x1, y1, x2, y2))
-        
-        self.logger.info(f"Detected {len(boxes_pixel)} objects for prompt: '{prompt}'")
-        
-        return boxes_pixel, phrases
-
-    def release(self) -> None:
-        """Release model and free GPU memory."""
-        try:
-            if self.model is not None:
-                del self.model
-                self.model = None
-                self.predict_fn = None
-            
-            self.logger.debug("GroundingDINODetector model released")
-            
-            import torch
-            import gc
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            gc.collect()
-        except Exception:
-            pass
-
-    def __del__(self):
-        """Destructor to ensure cleanup."""
-        self.release()
-
-    def __enter__(self):
-        """Context manager entry."""
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit with cleanup."""
-        self.release()
-        return False
-
-
-# ==============================================================================
 # MAIN PIPELINE
 # ==============================================================================
 
 class AutoRotoPipeline:
     """
-    Main auto-rotoscoping pipeline.
-    
+    Main auto-rotoscoping pipeline using SAM3.
+
+    SAM3 provides built-in text prompting with 270k+ concepts,
+    eliminating the need for separate detection (GroundingDINO).
+
     Coordinates all components to extract clean alpha mattes from video.
     """
-    
+
     def __init__(self, config: RotoConfig):
         self.config = config
         self.logger = setup_logging(config.verbose)
-        
+
         # Components (lazy loaded)
-        self._sam: Optional[SAM2Segmenter] = None
-        self._detector: Optional[GroundingDINODetector] = None
+        self._sam: Optional[SAM3Segmenter] = None
         self._refiner: Optional[AlphaRefiner] = None
         self._reader: Optional[VideoReader] = None
         self._writer: Optional[FrameWriter] = None
-    
+
     @property
-    def sam(self) -> SAM2Segmenter:
+    def sam(self) -> SAM3Segmenter:
+        """SAM3 segmenter with built-in text prompting."""
         if self._sam is None:
-            self._sam = SAM2Segmenter(
-                model_size=self.config.sam_model,
+            self._sam = SAM3Segmenter(
+                model_path="sam3.pt",
                 device=self.config.device,
                 compile_model=self.config.compile_model,
-                logger=self.logger
+                logger=self.logger,
+                # Inference settings from config
+                imgsz=self.config.sam_imgsz,
+                conf=self.config.sam_conf,
+                retina_masks=self.config.sam_retina_masks,
+                max_det=self.config.sam_max_det
             )
         return self._sam
-    
-    @property
-    def detector(self) -> GroundingDINODetector:
-        if self._detector is None:
-            self._detector = GroundingDINODetector(
-                box_threshold=self.config.detection_threshold,
-                text_threshold=self.config.text_threshold,
-                device=self.config.device,
-                logger=self.logger
-            )
-        return self._detector
-    
+
     @property
     def refiner(self) -> AlphaRefiner:
         if self._refiner is None:
@@ -1614,20 +1391,20 @@ class AutoRotoPipeline:
         return self._refiner
     
     def run(self):
-        """Run the full pipeline."""
+        """Run the full pipeline using SAM3."""
         import numpy as np
         import cv2
         from pathlib import Path
         import tempfile
         import shutil
-        
+
         self.logger.info("="*60)
-        self.logger.info("AUTO-ROTO Pipeline Started")
+        self.logger.info("AUTO-ROTO Pipeline Started (SAM3)")
         self.logger.info("="*60)
-        
+
         # Setup I/O
         self._reader = VideoReader(self.config.input_path, self.logger)
-        
+
         self._writer = FrameWriter(
             output_dir=self.config.output_dir,
             prefix="roto",
@@ -1636,134 +1413,123 @@ class AutoRotoPipeline:
             padding=self.config.frame_padding,
             logger=self.logger
         )
-        
-        # Extract frames to temp directory for SAM2
+
+        # Extract frames to temp directory
         temp_dir = Path(tempfile.mkdtemp(prefix="autoroto_"))
         frames_dir = temp_dir / "frames"
         frames_dir.mkdir()
-        
+
         self.logger.info("Extracting frames...")
         frames = []
         for idx, frame in enumerate(self._reader):
             frame_path = frames_dir / f"{idx:06d}.jpg"
             cv2.imwrite(str(frame_path), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             frames.append(frame)
-        
+
         self.logger.info(f"Extracted {len(frames)} frames")
-        
+
         try:
-            # Initialize SAM2 with video
-            self.logger.info("Initializing SAM2...")
-            self.sam.init_video(str(frames_dir))
-            
-            # Get initial prompt
-            first_frame = frames[0]
-            boxes = []
-            
-            if self.config.prompt:
-                # Text-based detection
-                self.logger.info(f"Detecting objects: '{self.config.prompt}'")
-                boxes, phrases = self.detector.detect(first_frame, self.config.prompt)
-                
-            elif self.config.box:
-                # Manual box
-                coords = [int(x) for x in self.config.box.split(',')]
-                boxes = [tuple(coords)]
-                
-            elif self.config.point:
-                # Point prompt
-                coords = [int(x) for x in self.config.point.split(',')]
-                self.sam.add_point_prompt(
-                    frame_idx=0,
-                    points=[tuple(coords)],
-                    labels=[1],
-                    object_id=1
-                )
-                
-            elif self.config.interactive:
-                # Interactive selection
-                boxes = self._interactive_selection(first_frame)
-            
-            else:
-                raise ValueError("No prompt specified. Use --prompt, --box, --point, or --interactive")
-            
-            # Add box prompts to SAM2
-            for obj_id, box in enumerate(boxes, start=1):
-                self.logger.info(f"Adding object {obj_id}: box {box}")
-                self.sam.add_box_prompt(
-                    frame_idx=0,
-                    box=box,
-                    object_id=obj_id
-                )
-            
-            # Propagate through video
-            self.logger.info("Propagating masks through video...")
-            
             all_masks = {}  # frame_idx -> combined mask
-            
-            # Forward propagation
-            if self.config.propagate_forward:
-                for frame_idx, obj_ids, masks in self.sam.propagate(reverse=False):
-                    # Combine all object masks
-                    # SAM2 outputs masks as logits (num_objects, 1, H, W), need sigmoid to convert to probabilities
-                    combined = np.zeros(masks.shape[-2:], dtype=np.float32)
-                    for mask in masks:
-                        # Squeeze out any extra dimensions (e.g., channel dim)
-                        mask_2d = mask.squeeze()
-                        # Apply sigmoid to convert logits to probabilities (0-1)
-                        mask_prob = 1.0 / (1.0 + np.exp(-mask_2d.astype(np.float32)))
-                        combined = np.maximum(combined, mask_prob)
-                    all_masks[frame_idx] = combined
-                    
+
+            if self.config.prompt:
+                # Text prompt - SAM3 handles this natively (no GroundingDINO needed)
+                text_prompts = self.config.prompt.split(".")
+                self.logger.info(f"Processing with SAM3 text prompts: {text_prompts}")
+
+                # Use SAM3 video predictor for temporal consistency
+                for frame_idx, mask in self.sam.segment_video_with_text(
+                    str(frames_dir), text_prompts
+                ):
+                    if mask is not None:
+                        all_masks[frame_idx] = mask
+
                     if frame_idx % 10 == 0:
                         self.logger.info(f"  Frame {frame_idx}/{len(frames)}")
-            
-            # Backward propagation
-            if self.config.propagate_backward:
-                self.logger.info("Backward propagation...")
-                for frame_idx, obj_ids, masks in self.sam.propagate(reverse=True):
-                    if frame_idx not in all_masks:
-                        combined = np.zeros(masks.shape[-2:], dtype=np.float32)
-                        for mask in masks:
-                            mask_2d = mask.squeeze()
-                            # Apply sigmoid to convert logits to probabilities (0-1)
-                            mask_prob = 1.0 / (1.0 + np.exp(-mask_2d.astype(np.float32)))
-                            combined = np.maximum(combined, mask_prob)
-                        all_masks[frame_idx] = combined
-            
+
+            elif self.config.box:
+                # Box prompt
+                coords = [int(x) for x in self.config.box.split(',')]
+                boxes = [tuple(coords)]
+                self.logger.info(f"Processing with box prompt: {boxes}")
+
+                for frame_idx, mask in self.sam.segment_video_with_box(
+                    str(frames_dir), boxes
+                ):
+                    if mask is not None:
+                        all_masks[frame_idx] = mask
+
+                    if frame_idx % 10 == 0:
+                        self.logger.info(f"  Frame {frame_idx}/{len(frames)}")
+
+            elif self.config.point:
+                # Point prompt - process frame by frame
+                coords = [int(x) for x in self.config.point.split(',')]
+                points = [tuple(coords)]
+                labels = [1]  # Foreground
+                self.logger.info(f"Processing with point prompt: {points}")
+
+                for idx, frame in enumerate(frames):
+                    masks = self.sam.segment_image_with_points(frame, points, labels)
+                    if masks:
+                        combined = np.zeros(frame.shape[:2], dtype=np.float32)
+                        for m in masks:
+                            combined = np.maximum(combined, m.astype(np.float32))
+                        all_masks[idx] = combined
+
+                    if idx % 10 == 0:
+                        self.logger.info(f"  Frame {idx}/{len(frames)}")
+
+            elif self.config.interactive:
+                # Interactive box selection
+                first_frame = frames[0]
+                boxes = self._interactive_selection(first_frame)
+                self.logger.info(f"Processing with interactive boxes: {boxes}")
+
+                for frame_idx, mask in self.sam.segment_video_with_box(
+                    str(frames_dir), boxes
+                ):
+                    if mask is not None:
+                        all_masks[frame_idx] = mask
+
+                    if frame_idx % 10 == 0:
+                        self.logger.info(f"  Frame {frame_idx}/{len(frames)}")
+
+            else:
+                raise ValueError("No prompt specified. Use --prompt, --box, --point, or --interactive")
+
             # Process and write frames
             self.logger.info("Writing output frames...")
-            
+
             for frame_idx in sorted(all_masks.keys()):
                 mask = all_masks[frame_idx]
                 rgb = frames[frame_idx]
-                
+
                 # Refine alpha
                 if self.config.refine_alpha:
                     alpha = self.refiner.refine(mask, rgb)
                 else:
                     alpha = mask.astype(np.float32)
-                
+
                 # Write outputs
                 self._writer.write_alpha(alpha, frame_idx)
-                
+
                 if self.config.include_rgb:
                     self._writer.write_rgba(rgb, alpha, frame_idx)
-                
+
                 if self.config.save_preview:
                     self._writer.write_preview(
                         rgb, alpha, frame_idx,
                         scale=self.config.preview_scale
                     )
-                
+
                 if frame_idx % 10 == 0:
                     self.logger.info(f"  Wrote frame {frame_idx}/{len(frames)}")
-            
+
             self.logger.info("="*60)
             self.logger.info("Pipeline Complete!")
             self.logger.info(f"Output: {self.config.output_dir}")
             self.logger.info("="*60)
-            
+
         finally:
             # Cleanup temp directory
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1819,23 +1585,16 @@ class AutoRotoPipeline:
             except Exception:
                 pass
             self._sam = None
-        
-        if self._detector is not None:
-            try:
-                self._detector.release()
-            except Exception:
-                pass
-            self._detector = None
-        
+
         if self._refiner is not None:
             self._refiner = None
-        
+
         if self._reader is not None:
             self._reader = None
-        
+
         if self._writer is not None:
             self._writer = None
-        
+
         # Clear GPU memory (defensive - may fail during shutdown)
         try:
             import torch
@@ -1868,11 +1627,11 @@ class AutoRotoPipeline:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="AUTO-ROTO: Production-Grade Automatic Rotoscoping",
+        description="AUTO-ROTO: Production-Grade Automatic Rotoscoping with SAM3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:
-  # Detect and roto person in video
+  # Detect and roto person in video (SAM3 has built-in text prompting)
   %(prog)s --input video.mp4 --prompt "person" --output ./roto_output
 
   # Multiple objects
@@ -1886,39 +1645,43 @@ EXAMPLES:
 
   # Image sequence input
   %(prog)s --input ./frames/ --prompt "person" --output ./output
+
+NOTE: SAM3 includes built-in text prompting (270k+ concepts).
+      No separate GroundingDINO required.
         """
     )
-    
+
     # Input/Output
     parser.add_argument("--input", "-i", required=True, help="Input video or image sequence")
     parser.add_argument("--output", "-o", default="./output", help="Output directory")
-    
+
     # Prompt type
     prompt_group = parser.add_mutually_exclusive_group(required=True)
-    prompt_group.add_argument("--prompt", "-p", help="Text prompt for object detection (use . to separate multiple)")
+    prompt_group.add_argument("--prompt", "-p", help="Text prompt for SAM3 (use . to separate multiple)")
     prompt_group.add_argument("--box", "-b", help="Box prompt: x1,y1,x2,y2")
     prompt_group.add_argument("--point", help="Point prompt: x,y")
     prompt_group.add_argument("--interactive", action="store_true", help="Interactive box selection")
-    
-    # SAM2 settings
-    parser.add_argument("--sam-model", default="large", 
-                       choices=["tiny", "small", "base_plus", "large"],
-                       help="SAM2 model size")
+
+    # SAM3 settings (no model size choices - SAM3 has single architecture)
     parser.add_argument("--no-backward", action="store_true", help="Disable backward propagation")
-    
-    # Detection settings
-    parser.add_argument("--detection-threshold", type=float, default=0.3,
-                       help="GroundingDINO detection threshold")
-    parser.add_argument("--text-threshold", type=float, default=0.25,
-                       help="GroundingDINO text threshold")
-    
+
+    # SAM3 inference settings
+    parser.add_argument("--sam-imgsz", type=int, default=0,
+                       help="SAM3 processing resolution (default: 0 = auto from input, max 8192)")
+    parser.add_argument("--sam-conf", type=float, default=0.25,
+                       help="SAM3 confidence threshold (default: 0.25, lower = more detections)")
+    parser.add_argument("--no-retina-masks", action="store_true",
+                       help="Disable high-resolution mask output")
+    parser.add_argument("--sam-max-det", type=int, default=100,
+                       help="Maximum detections per frame (default: 100)")
+
     # Alpha refinement
     parser.add_argument("--no-refine", action="store_true", help="Disable alpha refinement")
     parser.add_argument("--refine-iterations", type=int, default=3,
                        help="Alpha refinement iterations")
     parser.add_argument("--edge-softness", type=float, default=1.0,
                        help="Edge softness (0 = sharp, higher = softer)")
-    
+
     # Output settings
     parser.add_argument("--format", default="exr", choices=["exr", "png", "tiff"],
                        help="Output format")
@@ -1926,23 +1689,23 @@ EXAMPLES:
                        help="Output bit depth")
     parser.add_argument("--no-rgb", action="store_true", help="Don't include RGB output")
     parser.add_argument("--no-preview", action="store_true", help="Don't generate previews")
-    
+
     # Performance
     parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--no-compile", action="store_true", help="Disable model compilation")
-    
+
     # Debug
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    
+
     return parser.parse_args()
 
 
 def main():
     """Main entry point."""
     _check_dependencies()
-    
+
     args = parse_args()
-    
+
     config = RotoConfig(
         input_path=args.input,
         output_dir=args.output,
@@ -1950,10 +1713,13 @@ def main():
         box=args.box,
         point=args.point,
         interactive=args.interactive,
-        sam_model=args.sam_model,
         propagate_backward=not args.no_backward,
-        detection_threshold=args.detection_threshold,
-        text_threshold=args.text_threshold,
+        # SAM3 inference settings
+        sam_imgsz=args.sam_imgsz,
+        sam_conf=args.sam_conf,
+        sam_retina_masks=not args.no_retina_masks,
+        sam_max_det=args.sam_max_det,
+        # Alpha refinement
         refine_alpha=not args.no_refine,
         refine_iterations=args.refine_iterations,
         edge_softness=args.edge_softness,
@@ -1965,7 +1731,7 @@ def main():
         verbose=args.verbose,
         save_preview=not args.no_preview,
     )
-    
+
     pipeline = AutoRotoPipeline(config)
     pipeline.run()
 

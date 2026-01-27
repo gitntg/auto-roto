@@ -13,11 +13,11 @@ from .base import PipelineStage, StageContext, StageResult
 
 
 class SAMStage(PipelineStage):
-    """Stage 1: SAM2 Segmentation."""
+    """Stage 1: SAM3 Segmentation (built-in text prompting)."""
 
     @property
     def name(self) -> str:
-        return "SAM2 Segmentation"
+        return "SAM3 Segmentation"
 
     @property
     def order(self) -> int:
@@ -35,10 +35,10 @@ class SAMStage(PipelineStage):
         return not context.settings.get("skip_sam", False)
 
     def build_args(self, context: StageContext, output_dir: Path) -> List[str]:
+        # SAM3 has single model architecture, no --sam-model needed
         args = [
             "--input", context.input_path,
             "--output", str(output_dir),
-            "--sam-model", context.sam_model,
             "--format", context.output_format,
             "--bit-depth", str(context.bit_depth),
             "--no-refine",  # We do our own refinement

@@ -6,14 +6,18 @@ AUTO-ROTO FULL PIPELINE v5
 Production-grade automatic rotoscoping with professional quality enhancements.
 
 This is the main entry point for v5 which chains:
-    1. SAM2 segmentation (auto_roto.py)
+    1. SAM3 segmentation with built-in text prompting (auto_roto.py)
     2. Depth Anything V2 refinement (depth_refine.py)
-    3. Edge refinement (edge_refine.py) - NEW
-    4. Temporal coherence (temporal_smooth.py) - NEW
-    5. Matte combination (matte_combine.py) - NEW
+    3. Edge refinement (edge_refine.py)
+    4. Temporal coherence (temporal_smooth.py)
+    5. Matte combination (matte_combine.py)
     6. (Optional) Hair refinement (hair_refine.py)
 
+SAM3 has native Promptable Concept Segmentation (PCS) supporting 270k+ concepts,
+eliminating the need for separate detection (GroundingDINO).
+
 NEW IN V5:
+- SAM3 with built-in text prompting (no GroundingDINO needed)
 - Professional edge refinement with subpixel precision
 - Temporal coherence to prevent flickering
 - Multi-layer matte combination
@@ -24,7 +28,7 @@ USAGE:
     # Full pipeline with all enhancements
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
 
-    # Quick mode (SAM2 + edge refinement only)
+    # Quick mode (SAM3 + edge refinement only)
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quick
 
     # High quality with temporal smoothing
@@ -51,6 +55,27 @@ from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 
+# Environment verification - ensures correct conda environment
+REQUIRED_ENV = "autoroto"
+
+def _check_conda_environment():
+    """Verify we're running in the correct conda environment."""
+    current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    if current_env != REQUIRED_ENV:
+        print("\n" + "="*60)
+        print("WRONG CONDA ENVIRONMENT")
+        print("="*60)
+        print(f"\n  Current environment: {current_env or '(none/base)'}")
+        print(f"  Required environment: {REQUIRED_ENV}")
+        print(f"\n  Please activate the correct environment:")
+        print(f"    conda activate {REQUIRED_ENV}")
+        print("\n" + "="*60)
+        sys.exit(1)
+
+# Run environment check immediately on import
+_check_conda_environment()
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +87,7 @@ logger = logging.getLogger("FullPipelineV5")
 
 @dataclass
 class PipelineConfig:
-    """Configuration for the full pipeline."""
+    """Configuration for the full pipeline using SAM3."""
 
     # Input/Output
     input_path: str = ""
@@ -72,9 +97,6 @@ class PipelineConfig:
     prompt: str = ""
     box: str = ""
     interactive: bool = False
-
-    # SAM version selection
-    use_sam3: bool = False  # Use SAM3 with built-in text prompting (no Grounding DINO)
 
     # Quality preset
     quality: str = "standard"  # draft, standard, high, ultra
@@ -93,8 +115,13 @@ class PipelineConfig:
     vitmatte_adaptive_base: float = 2.0
     vitmatte_adaptive_max: float = 60.0
 
-    # Model sizes (auto-set by quality preset)
-    sam_model: str = ""
+    # SAM3 inference settings
+    sam_imgsz: int = 0              # Processing resolution (0 = auto from input, max 2048)
+    sam_conf: float = 0.25          # Confidence threshold (0.0-1.0, lower = more detections)
+    sam_retina_masks: bool = True   # High-resolution mask output
+    sam_max_det: int = 100          # Maximum detections per frame
+
+    # Depth model (auto-set by quality preset)
     depth_model: str = ""
 
     # DA3 Depth Sensitivity Settings (NEW)
@@ -127,10 +154,12 @@ class PipelineConfig:
 
 
 def get_quality_preset(quality: str) -> Dict[str, Any]:
-    """Get model sizes and settings for quality preset."""
+    """Get model sizes and settings for quality preset.
+
+    Note: SAM3 has a single model architecture, so no sam_model setting needed.
+    """
     presets = {
         'draft': {
-            'sam_model': 'tiny',
             'depth_model': 'small',
             'temporal_window': 3,
             'edge_softness': 0.5,
@@ -140,27 +169,24 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             'depth_norm_percentiles': (2.0, 98.0),
         },
         'standard': {
-            'sam_model': 'base_plus',
             'depth_model': 'base',
             'temporal_window': 5,
             'edge_softness': 1.0,
-            # DA3 settings: balanced
-            'depth_process_res': None,  # auto
+            # DA3 settings: balanced - explicit 1536 for reasonable quality/speed
+            'depth_process_res': 1536,  # Explicit resolution (was None/auto)
             'depth_process_method': 'upper',
             'depth_norm_percentiles': (2.0, 98.0),
         },
         'high': {
-            'sam_model': 'large',
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 7,
             'edge_softness': 1.5,
-            # DA3 settings: optimized for fine detail
-            'depth_process_res': None,  # auto (but lower_bound gives higher effective res)
-            'depth_process_method': 'lower',  # Higher effective resolution for hair
+            # DA3 settings: optimized for fine detail - explicit 2048 for quality
+            'depth_process_res': 2048,  # Explicit high resolution (was None/auto)
+            'depth_process_method': 'lower',  # process_res is min dimension
             'depth_norm_percentiles': (1.0, 99.0),  # Wider range preserves more detail
         },
         'ultra': {
-            'sam_model': 'large',
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
             'temporal_window': 9,
             'edge_softness': 2.0,
@@ -287,11 +313,15 @@ def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
         text_prompts = config.prompt.split(".") if config.prompt else ["person"]
         logger.info(f"Text prompts: {text_prompts}")
 
-        # Initialize SAM3
+        # Initialize SAM3 with inference settings
         sam3 = SAM3Segmenter(
             model_path="sam3.pt",
             device=config.device,
-            logger=logger
+            logger=logger,
+            imgsz=config.sam_imgsz,
+            conf=config.sam_conf,
+            retina_masks=config.sam_retina_masks,
+            max_det=config.sam_max_det
         )
 
         # Setup frame writer
@@ -359,12 +389,10 @@ def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
 
 
 def run_pipeline(config: PipelineConfig):
-    """Run the full v5 pipeline."""
+    """Run the full v5 pipeline using SAM3."""
 
     # Apply quality preset
     preset = get_quality_preset(config.quality)
-    if not config.sam_model:
-        config.sam_model = preset['sam_model']
     if not config.depth_model:
         config.depth_model = preset['depth_model']
     if config.temporal_window == 5:  # Default
@@ -403,63 +431,31 @@ def run_pipeline(config: PipelineConfig):
     pipeline_start = time.time()
 
     logger.info("="*60)
-    logger.info("AUTO-ROTO v5 PIPELINE")
+    logger.info("AUTO-ROTO v5 PIPELINE (SAM3)")
     logger.info("="*60)
     logger.info(f"Input: {config.input_path}")
     logger.info(f"Output: {config.output_dir}")
     logger.info(f"Quality: {config.quality}")
-    if config.use_sam3:
-        logger.info("SAM Mode: SAM3 (built-in text prompting, no Grounding DINO)")
-    else:
-        logger.info(f"SAM Model: {config.sam_model} (SAM2 + Grounding DINO)")
+    logger.info("SAM Mode: SAM3 (built-in text prompting)")
+    sam_imgsz_str = f"{config.sam_imgsz}" if config.sam_imgsz > 0 else "auto"
+    logger.info(f"SAM3: imgsz={sam_imgsz_str}, conf={config.sam_conf}, retina={config.sam_retina_masks}")
     logger.info(f"Depth Model: {config.depth_model}")
     logger.info("="*60)
 
     # =========================================================================
-    # STAGE 1: SAM Segmentation (SAM2 or SAM3)
+    # STAGE 1: SAM3 Segmentation (built-in text prompting)
     # =========================================================================
     if not config.skip_sam:
-        if config.use_sam3:
-            # Use SAM3 with built-in text prompting
-            success = run_sam3_stage(config, sam_output)
-        else:
-            # Use SAM2 with Grounding DINO
-            auto_roto_script = find_script("auto_roto.py")
-
-            sam_args = [
-                "--input", config.input_path,
-                "--output", str(sam_output),
-                "--sam-model", config.sam_model,
-                "--format", config.output_format,
-                "--bit-depth", str(config.bit_depth),
-                "--no-refine",  # We'll do our own refinement
-            ]
-
-            if config.prompt:
-                sam_args.extend(["--prompt", config.prompt])
-            elif config.box:
-                sam_args.extend(["--box", config.box])
-            if config.interactive:
-                sam_args.append("--interactive")
-
-            if config.no_compile:
-                sam_args.append("--no-compile")
-
-            if config.verbose:
-                sam_args.append("--verbose")
-
-            success = run_python_stage(
-                auto_roto_script, sam_args,
-                "SAM2 Segmentation", config.verbose
-            )
+        # Always use SAM3 with built-in text prompting
+        success = run_sam3_stage(config, sam_output)
 
         if not success:
-            logger.error("Pipeline failed at SAM stage")
+            logger.error("Pipeline failed at SAM3 stage")
             return False
 
         clear_gpu_memory()
     else:
-        logger.info("Skipping SAM (--skip-sam)")
+        logger.info("Skipping SAM3 (--skip-sam)")
 
     # =========================================================================
     # STAGE 2: Depth Refinement
@@ -784,27 +780,30 @@ def run_pipeline(config: PipelineConfig):
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="AUTO-ROTO v5: Production-grade automatic rotoscoping",
+        description="AUTO-ROTO v5: Production-grade automatic rotoscoping with SAM3",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:
-  # Full quality pipeline
+  # Full quality pipeline (SAM3 has built-in text prompting)
   %(prog)s --input video.mp4 --prompt "person" --output ./output
 
   # Process PNG sequence with high quality
   %(prog)s --input /path/to/frames/ --prompt "car" --output ./output --quality high
 
-  # Quick mode (SAM2 + edge only)
+  # Quick mode (SAM3 + edge only)
   %(prog)s --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
 
   # Interactive selection
   %(prog)s --input video.mp4 --interactive --output ./output
 
 QUALITY PRESETS:
-  draft    - Fastest, tiny/small models
+  draft    - Fastest, small depth model
   standard - Balanced quality and speed (default)
-  high     - Best quality, large models
+  high     - Best quality, large depth model
   ultra    - Maximum quality, longer temporal window
+
+NOTE: SAM3 includes built-in text prompting (270k+ concepts).
+      No separate GroundingDINO required.
         """
     )
 
@@ -817,7 +816,7 @@ QUALITY PRESETS:
     # Prompt type
     prompt_group = parser.add_mutually_exclusive_group(required=True)
     prompt_group.add_argument("--prompt", "-p",
-                             help="Text prompt for detection")
+                             help="Text prompt for SAM3 (use . to separate multiple)")
     prompt_group.add_argument("--box", "-b",
                              help="Box prompt: x1,y1,x2,y2")
     prompt_group.add_argument("--interactive", action="store_true",
@@ -829,14 +828,9 @@ QUALITY PRESETS:
                        default="standard",
                        help="Quality preset (default: standard)")
 
-    # SAM3 mode (no Grounding DINO needed)
-    parser.add_argument("--use-sam3", action="store_true",
-                       help="Use SAM3 with built-in text prompting (no Grounding DINO needed). "
-                            "Requires ultralytics>=8.3.237 and sam3.pt checkpoint.")
-
     # Stage control
     parser.add_argument("--skip-sam", action="store_true",
-                       help="Skip SAM2 (use existing alpha)")
+                       help="Skip SAM3 (use existing alpha)")
     parser.add_argument("--skip-depth", action="store_true",
                        help="Skip depth refinement")
     parser.add_argument("--skip-vitmatte", action="store_true",
@@ -850,10 +844,17 @@ QUALITY PRESETS:
     parser.add_argument("--with-hair", action="store_true",
                        help="Enable hair refinement (off by default)")
 
-    # Advanced
-    parser.add_argument("--sam-model",
-                       choices=["tiny", "small", "base_plus", "large"],
-                       help="Override SAM2 model size")
+    # SAM3 settings
+    parser.add_argument("--sam-imgsz", type=int, default=0,
+                       help="SAM3 processing resolution (default: 0 = auto from input, max 2048)")
+    parser.add_argument("--sam-conf", type=float, default=0.25,
+                       help="SAM3 confidence threshold (default: 0.25, lower = more inclusive masks)")
+    parser.add_argument("--no-retina-masks", action="store_true",
+                       help="Disable high-resolution mask output")
+    parser.add_argument("--sam-max-det", type=int, default=100,
+                       help="Maximum detections per frame (default: 100)")
+
+    # Depth settings
     parser.add_argument("--depth-model",
                        choices=["small", "base", "large", "nested-base", "nested-large"],
                        help="Override Depth model (large=DA3Mono best for hair detail)")
@@ -902,7 +903,7 @@ QUALITY PRESETS:
     # Performance
     parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--no-compile", action="store_true",
-                       help="Disable SAM2 model compilation (auto-enabled on Windows)")
+                       help="Disable SAM model compilation (auto-enabled on Windows)")
     parser.add_argument("--force-compile", action="store_true",
                        help="Force torch.compile even on Windows (may fail)")
 
@@ -925,7 +926,6 @@ def main():
         prompt=args.prompt or "",
         box=args.box or "",
         interactive=args.interactive,
-        use_sam3=args.use_sam3,
         quality=args.quality,
         skip_sam=args.skip_sam,
         skip_depth=args.skip_depth,
@@ -934,13 +934,17 @@ def main():
         skip_temporal=args.skip_temporal,
         skip_combine=args.skip_combine,
         skip_hair=not args.with_hair,
-        sam_model=args.sam_model or "",
         depth_model=args.depth_model or "",
         # DA3 depth sensitivity settings
         depth_process_res=args.depth_res,
         depth_process_method=args.depth_method,
         depth_norm_percentiles=tuple(args.depth_percentiles),
         use_depth_confidence=args.use_depth_confidence,
+        # SAM3 settings
+        sam_imgsz=args.sam_imgsz,
+        sam_conf=args.sam_conf,
+        sam_retina_masks=not args.no_retina_masks,
+        sam_max_det=args.sam_max_det,
         # ViTMatte settings
         vitmatte_motion_aware=args.vitmatte_motion,
         vitmatte_adaptive_base=args.vitmatte_base,

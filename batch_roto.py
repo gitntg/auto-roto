@@ -43,6 +43,28 @@ from typing import List, Optional, Dict, Any
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 
+
+# Environment verification - ensures correct conda environment
+REQUIRED_ENV = "autoroto"
+
+def _check_conda_environment():
+    """Verify we're running in the correct conda environment."""
+    current_env = os.environ.get("CONDA_DEFAULT_ENV", "")
+    if current_env != REQUIRED_ENV:
+        print("\n" + "="*60)
+        print("WRONG CONDA ENVIRONMENT")
+        print("="*60)
+        print(f"\n  Current environment: {current_env or '(none/base)'}")
+        print(f"  Required environment: {REQUIRED_ENV}")
+        print(f"\n  Please activate the correct environment:")
+        print(f"    conda activate {REQUIRED_ENV}")
+        print("\n" + "="*60)
+        sys.exit(1)
+
+# Run environment check immediately on import
+_check_conda_environment()
+
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -54,23 +76,22 @@ logger = logging.getLogger("BatchRoto")
 
 @dataclass
 class RotoJob:
-    """Single rotoscoping job."""
+    """Single rotoscoping job using SAM3."""
     input_path: str
     output_dir: str
     prompt: Optional[str] = None
     box: Optional[str] = None
     point: Optional[str] = None
-    sam_model: str = "large"
     refine_alpha: bool = True
     output_format: str = "exr"
     bit_depth: int = 16
-    
+
     # Status tracking
     status: str = "pending"  # pending, running, completed, failed
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     error_message: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "input": self.input_path,
@@ -78,7 +99,6 @@ class RotoJob:
             "prompt": self.prompt,
             "box": self.box,
             "point": self.point,
-            "sam_model": self.sam_model,
             "refine_alpha": self.refine_alpha,
             "output_format": self.output_format,
             "bit_depth": self.bit_depth,
@@ -176,46 +196,43 @@ class BatchProcessor:
         """Load jobs from a config file."""
         with open(config_path, 'r') as f:
             config = json.load(f)
-        
+
         defaults = {
             'prompt': config.get('default_prompt'),
-            'sam_model': config.get('default_model', 'large'),
             'refine_alpha': config.get('default_refine', True),
             'output_format': config.get('default_format', 'exr'),
             'bit_depth': config.get('default_bit_depth', 16),
         }
-        
+
         for job_config in config.get('jobs', []):
             # Merge defaults with job config
             job_params = {**defaults, **job_config}
-            
+
             job = RotoJob(
                 input_path=job_params['input'],
                 output_dir=job_params.get('output', f"{job_params['input']}_roto"),
                 prompt=job_params.get('prompt'),
                 box=job_params.get('box'),
                 point=job_params.get('point'),
-                sam_model=job_params.get('sam_model', 'large'),
                 refine_alpha=job_params.get('refine_alpha', True),
                 output_format=job_params.get('output_format', 'exr'),
                 bit_depth=job_params.get('bit_depth', 16),
             )
             self.add_job(job)
-        
+
         logger.info(f"Loaded {len(self.jobs)} jobs from config")
     
     def _build_command(self, job: RotoJob) -> List[str]:
-        """Build command line for a job."""
+        """Build command line for a job (SAM3, no --sam-model needed)."""
         cmd = [
             self.python_interpreter,
             self.auto_roto_script,
             '--input', job.input_path,
             '--output', job.output_dir,
-            '--sam-model', job.sam_model,
             '--format', job.output_format,
             '--bit-depth', str(job.bit_depth),
         ]
-        
+
         if job.prompt:
             cmd.extend(['--prompt', job.prompt])
         elif job.box:
@@ -224,10 +241,10 @@ class BatchProcessor:
             cmd.extend(['--point', job.point])
         else:
             raise ValueError(f"Job has no prompt/box/point: {job.input_path}")
-        
+
         if not job.refine_alpha:
             cmd.append('--no-refine')
-        
+
         return cmd
     
     def _run_job(self, job: RotoJob) -> RotoJob:
@@ -332,7 +349,7 @@ class BatchProcessor:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AUTO-ROTO Batch Processor",
+        description="AUTO-ROTO Batch Processor (SAM3)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:
@@ -344,69 +361,68 @@ EXAMPLES:
 
   # Process specific videos
   %(prog)s --files video1.mp4 video2.mp4 --prompt "person" --output ./output/
+
+NOTE: Uses SAM3 with built-in text prompting (270k+ concepts).
+      No separate GroundingDINO required.
         """
     )
-    
+
     # Input options
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--input", "-i", help="Input folder with videos")
     input_group.add_argument("--config", "-c", help="JSON config file")
     input_group.add_argument("--files", "-f", nargs='+', help="Specific video files")
-    
-    # Common options
+
+    # Common options (no --sam-model, SAM3 has single architecture)
     parser.add_argument("--output", "-o", default="./output", help="Output folder")
     parser.add_argument("--prompt", "-p", help="Text prompt for all videos")
-    parser.add_argument("--sam-model", default="large",
-                       choices=["tiny", "small", "base_plus", "large"])
     parser.add_argument("--format", default="exr", choices=["exr", "png", "tiff"])
     parser.add_argument("--no-refine", action="store_true")
-    
+
     # Processing options
     parser.add_argument("--parallel", action="store_true",
                        help="Run jobs in parallel (use with caution)")
     parser.add_argument("--report", help="Save report to JSON file")
-    
+
     args = parser.parse_args()
-    
+
     processor = BatchProcessor()
-    
+
     if args.config:
         processor.load_config(args.config)
-    
+
     elif args.input:
         if not args.prompt:
             parser.error("--prompt required when using --input")
-        
+
         processor.add_folder(
             args.input,
             args.output,
             args.prompt,
-            sam_model=args.sam_model,
             refine_alpha=not args.no_refine,
             output_format=args.format,
         )
-    
+
     elif args.files:
         if not args.prompt:
             parser.error("--prompt required when using --files")
-        
+
         for video_file in args.files:
             video_path = Path(video_file)
             output_dir = Path(args.output) / f"{video_path.stem}_roto"
-            
+
             job = RotoJob(
                 input_path=str(video_path),
                 output_dir=str(output_dir),
                 prompt=args.prompt,
-                sam_model=args.sam_model,
                 refine_alpha=not args.no_refine,
                 output_format=args.format,
             )
             processor.add_job(job)
-    
+
     # Run processing
     processor.run(parallel=args.parallel)
-    
+
     # Save report
     if args.report:
         processor.save_report(args.report)
