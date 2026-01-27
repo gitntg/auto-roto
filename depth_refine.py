@@ -51,6 +51,50 @@ import numpy as np
 # ==============================================================================
 
 @dataclass
+class DepthStatistics:
+    """Statistics computed from depth analysis for foreground/background separation."""
+
+    # Foreground depth stats (close to camera = LOW values)
+    fg_depth_median: float
+    fg_depth_std: float
+    fg_depth_min: float
+    fg_depth_max: float
+
+    # Background depth stats (far from camera = HIGH values)
+    bg_depth_median: float
+    bg_depth_min: float
+    bg_depth_max: float
+
+    # Computed thresholds
+    foreground_threshold: float      # Depth threshold for general foreground
+    hair_foreground_threshold: float  # More permissive threshold for hair
+
+    # Distance transform (for core detection)
+    dist_inside: np.ndarray
+
+
+@dataclass
+class HairProcessingContext:
+    """Context object for hair matte computation, grouping related parameters."""
+
+    # Input images
+    rgb: np.ndarray
+    alpha: np.ndarray
+    depth: np.ndarray
+
+    # Distance transforms
+    dist_inside: np.ndarray
+    dist_outside: np.ndarray
+
+    # Masks
+    outside_mask: np.ndarray
+    is_foreground_depth: np.ndarray
+
+    # Statistics
+    depth_stats: 'DepthStatistics'
+
+
+@dataclass
 class DepthRefineConfig:
     """Configuration for depth-guided refinement."""
 
@@ -100,6 +144,23 @@ class DepthRefineConfig:
     # Debug
     verbose: bool = False
     save_debug: bool = False      # Save intermediate visualizations
+
+
+# ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+# Tiled depth estimation
+DEPTH_DEFAULT_TILE_SIZE = 2048       # Default tile size for high-res depth (was 1024)
+DEPTH_MIN_TILE_SIZE = 1024           # Minimum tile size for quality
+DEPTH_MAX_PROCESS_RES = 8192         # Maximum processing resolution (8K cap)
+
+# Distance transform thresholds
+DEEP_CORE_MIN_DISTANCE = 30          # Minimum distance for deep core pixels
+DEEP_CORE_MIN_PIXELS = 100           # Minimum pixels to use core statistics
+
+# Bit depth conversion
+BIT_DEPTH_16_TO_8_DIVISOR = 256      # Divide 16-bit values by 256 for 8-bit
 
 
 # ==============================================================================
@@ -423,10 +484,10 @@ class DepthEstimator:
         # Determine tile size based on process_res setting or default to 2048
         # Larger tiles = better quality but more VRAM
         if tile_size is None:
-            if self.process_res is not None and self.process_res >= 1024:
-                tile_size = min(self.process_res, 2048)  # Use process_res but cap at 2048
+            if self.process_res is not None and self.process_res >= DEPTH_MIN_TILE_SIZE:
+                tile_size = min(self.process_res, DEPTH_DEFAULT_TILE_SIZE)
             else:
-                tile_size = 2048  # Default to 2048 for better quality
+                tile_size = DEPTH_DEFAULT_TILE_SIZE
 
         if overlap is None:
             overlap = tile_size // 4  # 25% overlap for smooth blending
@@ -781,7 +842,7 @@ class DepthGuidedRefiner:
         depth: np.ndarray,
         alpha: np.ndarray,
         mask_binary: np.ndarray
-    ) -> dict:
+    ) -> DepthStatistics:
         """
         Analyze depth statistics for foreground and background regions.
 
@@ -790,32 +851,32 @@ class DepthGuidedRefiner:
         - Background (far from camera) has HIGH depth values
 
         Returns:
-            Dictionary with depth statistics including thresholds.
+            DepthStatistics dataclass with depth statistics and thresholds.
         """
         import cv2
 
         # Distance transform for finding deep core
         dist_inside = cv2.distanceTransform(mask_binary, cv2.DIST_L2, 5)
-        deep_core = dist_inside > 30
+        deep_core = dist_inside > DEEP_CORE_MIN_DISTANCE
 
         # Foreground depth statistics (close = LOW values)
-        if np.sum(deep_core) > 100:
-            fg_depth_median = np.median(depth[deep_core])
-            fg_depth_std = np.std(depth[deep_core])
-            fg_depth_min = np.percentile(depth[deep_core], 5)
-            fg_depth_max = np.percentile(depth[deep_core], 95)
+        if np.sum(deep_core) > DEEP_CORE_MIN_PIXELS:
+            fg_depth_median = float(np.median(depth[deep_core]))
+            fg_depth_std = float(np.std(depth[deep_core]))
+            fg_depth_min = float(np.percentile(depth[deep_core], 5))
+            fg_depth_max = float(np.percentile(depth[deep_core], 95))
         else:
-            fg_depth_median = np.median(depth[alpha > 0.5])
+            fg_depth_median = float(np.median(depth[alpha > 0.5]))
             fg_depth_std = 0.1
             fg_depth_min = fg_depth_median - 0.15
             fg_depth_max = fg_depth_median + 0.15
 
         # Background depth statistics (far = HIGH values)
         bg_region = dist_inside == 0
-        if np.sum(bg_region) > 100:
-            bg_depth_median = np.median(depth[bg_region])
-            bg_depth_min = np.percentile(depth[bg_region], 5)
-            bg_depth_max = np.percentile(depth[bg_region], 95)
+        if np.sum(bg_region) > DEEP_CORE_MIN_PIXELS:
+            bg_depth_median = float(np.median(depth[bg_region]))
+            bg_depth_min = float(np.percentile(depth[bg_region], 5))
+            bg_depth_max = float(np.percentile(depth[bg_region], 95))
         else:
             # Defaults for when no background region detected
             # Background should have HIGH values (far from camera)
@@ -838,25 +899,25 @@ class DepthGuidedRefiner:
         self.logger.debug(f"Foreground threshold: {foreground_threshold:.4f}")
         self.logger.debug(f"Hair foreground threshold: {hair_foreground_threshold:.4f}")
 
-        return {
-            'fg_depth_median': fg_depth_median,
-            'fg_depth_std': fg_depth_std,
-            'fg_depth_min': fg_depth_min,
-            'fg_depth_max': fg_depth_max,
-            'bg_depth_median': bg_depth_median,
-            'bg_depth_min': bg_depth_min,
-            'bg_depth_max': bg_depth_max,
-            'foreground_threshold': foreground_threshold,
-            'hair_foreground_threshold': hair_foreground_threshold,
-            'dist_inside': dist_inside,
-        }
+        return DepthStatistics(
+            fg_depth_median=fg_depth_median,
+            fg_depth_std=fg_depth_std,
+            fg_depth_min=fg_depth_min,
+            fg_depth_max=fg_depth_max,
+            bg_depth_median=bg_depth_median,
+            bg_depth_min=bg_depth_min,
+            bg_depth_max=bg_depth_max,
+            foreground_threshold=foreground_threshold,
+            hair_foreground_threshold=hair_foreground_threshold,
+            dist_inside=dist_inside,
+        )
 
     def _compute_edge_matte(
         self,
         alpha: np.ndarray,
         depth: np.ndarray,
         mask_binary: np.ndarray,
-        depth_stats: dict
+        depth_stats: DepthStatistics
     ) -> np.ndarray:
         """
         Compute depth-gated edge matte.
@@ -865,10 +926,10 @@ class DepthGuidedRefiner:
         """
         import cv2
 
-        dist_inside = depth_stats['dist_inside']
-        foreground_threshold = depth_stats['foreground_threshold']
-        fg_depth_max = depth_stats['fg_depth_max']
-        fg_depth_min = depth_stats['fg_depth_min']
+        dist_inside = depth_stats.dist_inside
+        foreground_threshold = depth_stats.foreground_threshold
+        fg_depth_max = depth_stats.fg_depth_max
+        fg_depth_min = depth_stats.fg_depth_min
 
         # Distance transforms
         dist_outside = cv2.distanceTransform(1 - mask_binary, cv2.DIST_L2, 5)
@@ -1007,17 +1068,13 @@ class DepthGuidedRefiner:
 
     def _compute_hair_matte(
         self,
-        rgb: np.ndarray,
-        alpha: np.ndarray,
-        depth: np.ndarray,
-        dist_inside: np.ndarray,
-        dist_outside: np.ndarray,
-        outside_mask: np.ndarray,
-        is_foreground_depth: np.ndarray,
-        depth_stats: dict
+        ctx: HairProcessingContext
     ) -> np.ndarray:
         """
         Compute hair-specific matte using texture, color, and depth analysis.
+
+        Args:
+            ctx: HairProcessingContext containing all input images, masks, and statistics.
 
         This is the most complex stage combining multiple methods:
         - Method 1: Texture + Color evidence
@@ -1026,11 +1083,21 @@ class DepthGuidedRefiner:
         """
         import cv2
 
-        fg_depth_min = depth_stats['fg_depth_min']
-        fg_depth_max = depth_stats['fg_depth_max']
-        fg_depth_median = depth_stats['fg_depth_median']
-        foreground_threshold = depth_stats['foreground_threshold']
-        hair_depth_threshold = depth_stats['hair_foreground_threshold']
+        # Unpack context for local variable access
+        rgb = ctx.rgb
+        alpha = ctx.alpha
+        depth = ctx.depth
+        dist_inside = ctx.dist_inside
+        dist_outside = ctx.dist_outside
+        outside_mask = ctx.outside_mask
+        is_foreground_depth = ctx.is_foreground_depth
+        depth_stats = ctx.depth_stats
+
+        fg_depth_min = depth_stats.fg_depth_min
+        fg_depth_max = depth_stats.fg_depth_max
+        fg_depth_median = depth_stats.fg_depth_median
+        foreground_threshold = depth_stats.foreground_threshold
+        hair_depth_threshold = depth_stats.hair_foreground_threshold
 
         hair_matte = np.zeros_like(alpha)
 
@@ -1189,12 +1256,17 @@ class DepthGuidedRefiner:
         # Stage 4: Compute hair matte (if RGB available)
         hair_matte = np.zeros_like(alpha)
         if rgb is not None:
-            hair_matte = self._compute_hair_matte(
-                rgb, alpha, depth,
-                depth_stats['dist_inside'], dist_outside,
-                outside_mask, is_foreground_depth,
-                depth_stats
+            ctx = HairProcessingContext(
+                rgb=rgb,
+                alpha=alpha,
+                depth=depth,
+                dist_inside=depth_stats.dist_inside,
+                dist_outside=dist_outside,
+                outside_mask=outside_mask,
+                is_foreground_depth=is_foreground_depth,
+                depth_stats=depth_stats
             )
+            hair_matte = self._compute_hair_matte(ctx)
 
         # Stage 5: Combine all mattes
         return self._combine_mattes(core_matte, edge_matte, hair_matte, alpha)

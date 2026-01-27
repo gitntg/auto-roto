@@ -120,6 +120,23 @@ def _check_dependencies():
         sys.exit(1)
 
 # ==============================================================================
+# CONSTANTS
+# ==============================================================================
+
+# SAM3 inference resolution limits
+SAM3_DEFAULT_IMGSZ = 1024           # Default processing resolution
+SAM3_MAX_AUTO_IMGSZ = 2048          # Maximum auto-detected resolution (VRAM limited)
+SAM3_MIN_IMGSZ = 640                # Minimum practical resolution
+
+# Bit depth conversion
+BIT_DEPTH_16_TO_8_DIVISOR = 256     # Divide 16-bit values by 256 for 8-bit
+
+# Default thresholds
+DEFAULT_SAM3_CONFIDENCE = 0.25      # Default detection confidence threshold
+DEFAULT_SAM3_MAX_DETECTIONS = 100   # Maximum objects per frame
+
+
+# ==============================================================================
 # CONFIGURATION
 # ==============================================================================
 
@@ -199,15 +216,55 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
 # VIDEO I/O
 # ==============================================================================
 
+def normalize_frame_to_rgb(frame, cv2_module=None, np_module=None):
+    """
+    Normalize a frame to 8-bit RGB format.
+
+    Handles:
+        - 16-bit to 8-bit conversion
+        - Float to uint8 conversion
+        - Grayscale to RGB conversion
+        - BGRA/BGR to RGB conversion
+
+    Args:
+        frame: Input frame (numpy array)
+        cv2_module: Optional cv2 module (for lazy import)
+        np_module: Optional numpy module (for lazy import)
+
+    Returns:
+        RGB uint8 numpy array
+    """
+    import cv2 as cv2_mod
+    import numpy as np_mod
+    cv2_mod = cv2_module or cv2_mod
+    np_mod = np_module or np_mod
+
+    # Convert to 8-bit if needed
+    if frame.dtype == np_mod.uint16:
+        frame = (frame / BIT_DEPTH_16_TO_8_DIVISOR).astype(np_mod.uint8)
+    elif frame.dtype in (np_mod.float32, np_mod.float64):
+        frame = (np_mod.clip(frame, 0, 1) * 255).astype(np_mod.uint8)
+
+    # Convert to RGB
+    if len(frame.shape) == 2:
+        frame = cv2_mod.cvtColor(frame, cv2_mod.COLOR_GRAY2RGB)
+    elif frame.shape[2] == 4:
+        frame = cv2_mod.cvtColor(frame, cv2_mod.COLOR_BGRA2RGB)
+    else:
+        frame = cv2_mod.cvtColor(frame, cv2_mod.COLOR_BGR2RGB)
+
+    return frame
+
+
 class VideoReader:
     """
     Read video files or image sequences into frames.
-    
+
     Supports:
         - Video files: .mp4, .mov, .avi, .mkv
         - Image sequences: frame.####.exr, frame_####.png, etc.
     """
-    
+
     SUPPORTED_VIDEO = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.mxf'}
     SUPPORTED_IMAGE = {'.exr', '.png', '.jpg', '.jpeg', '.tiff', '.tif', '.dpx'}
     
@@ -341,30 +398,14 @@ class VideoReader:
     def __iter__(self):
         """Iterate over frames as numpy arrays (RGB)."""
         import cv2
-        import numpy as np
-        
+
         if self._is_sequence:
             for frame_path in self.frames:
                 frame = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
                 if frame is None:
                     self.logger.warning(f"Skipping unreadable frame: {frame_path}")
                     continue
-                
-                # Convert 16-bit to 8-bit if needed
-                if frame.dtype == np.uint16:
-                    frame = (frame / 256).astype(np.uint8)
-                elif frame.dtype in (np.float32, np.float64):
-                    frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-
-                # Convert to RGB
-                if len(frame.shape) == 2:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                elif frame.shape[2] == 4:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-                else:
-                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                yield frame
+                yield normalize_frame_to_rgb(frame)
         else:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             while True:
@@ -376,24 +417,12 @@ class VideoReader:
     def get_frame(self, idx: int):
         """Get specific frame by index."""
         import cv2
-        import numpy as np
 
         if self._is_sequence:
             if 0 <= idx < len(self.frames):
                 frame = cv2.imread(str(self.frames[idx]), cv2.IMREAD_UNCHANGED)
                 if frame is not None:
-                    # Convert 16-bit to 8-bit if needed
-                    if frame.dtype == np.uint16:
-                        frame = (frame / 256).astype(np.uint8)
-                    elif frame.dtype in (np.float32, np.float64):
-                        frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-
-                    if len(frame.shape) == 2:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                    elif frame.shape[2] == 4:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-                    else:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    return normalize_frame_to_rgb(frame)
                 return frame
         else:
             self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -915,14 +944,13 @@ class SAM3Segmenter:
         #   - 12GB VRAM: ~1536 max
         #   - 24GB VRAM: ~2048 max
         #   - 48GB VRAM: ~3072 max
-        # Default cap at 2048 for RTX 4090 class GPUs
-        MAX_AUTO_IMGSZ = 2048
+        # Default cap for RTX 4090 class GPUs
 
         h, w = image_shape[:2]
         max_dim = max(h, w)
-        resolved = min(max_dim, MAX_AUTO_IMGSZ)
+        resolved = min(max_dim, SAM3_MAX_AUTO_IMGSZ)
 
-        self.logger.info(f"Auto imgsz: input={w}x{h}, using imgsz={resolved} (max={MAX_AUTO_IMGSZ})")
+        self.logger.info(f"Auto imgsz: input={w}x{h}, using imgsz={resolved} (max={SAM3_MAX_AUTO_IMGSZ})")
         return resolved
 
     @property
