@@ -25,17 +25,17 @@ NEW IN V5:
 - Proper premultiplied alpha compositing
 
 USAGE:
-    # Full pipeline with all enhancements
+    # Standard quality (balanced)
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
 
-    # Quick mode (SAM3 + edge refinement only)
-    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quick
+    # Ultra quality + hair detail (max quality, slower)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality ultra --with-hair --depth-res 2048 --depth-method lower --depth-percentiles 0 100 --use-depth-confidence --vitmatte-motion
 
-    # High quality with temporal smoothing
-    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
+    # Fast preview (draft quality, no temporal)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
 
-    # Process PNG sequence
-    python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output
+    # Process PNG sequence (ultra quality)
+    python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output --quality ultra --with-hair
 
 Author: AUTO-ROTO v5
 License: MIT
@@ -115,6 +115,17 @@ class PipelineConfig:
     vitmatte_adaptive_base: float = 2.0
     vitmatte_adaptive_max: float = 60.0
 
+    # Hair polish settings (applied to edge/unknown regions)
+    # None = use quality preset value; explicit values override preset
+    hair_gamma: float = None          # Lower = more visible strands (0.5-1.0)
+    hair_black_point: float = None    # Lower = preserve faint tips (0.0-0.1)
+    hair_gain: float = None           # Higher = more solid core (1.0-1.5)
+    hair_polish_enabled: bool = True  # Allow disabling entirely
+
+    # Guided Filter settings
+    guided_filter_radius: int = None      # None = use quality preset
+    guided_filter_eps: float = None       # None = use quality preset
+
     # SAM3 inference settings
     sam_imgsz: int = 0              # Processing resolution (0 = auto from input, max 2048)
     sam_conf: float = 0.25          # Confidence threshold (0.0-1.0, lower = more detections)
@@ -167,6 +178,13 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             'depth_process_res': None,  # auto (image size)
             'depth_process_method': 'upper',
             'depth_norm_percentiles': (2.0, 98.0),
+            # Hair polish: more aggressive for speed
+            'hair_gamma': 0.7,
+            'hair_black_point': 0.03,
+            'hair_gain': 1.2,
+            # Guided Filter: fast, general purpose
+            'guided_filter_radius': 4,
+            'guided_filter_eps': 1e-4,
         },
         'standard': {
             'depth_model': 'base',
@@ -176,6 +194,13 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             'depth_process_res': 1536,  # Explicit resolution (was None/auto)
             'depth_process_method': 'upper',
             'depth_norm_percentiles': (2.0, 98.0),
+            # Hair polish: balanced
+            'hair_gamma': 0.8,
+            'hair_black_point': 0.02,
+            'hair_gain': 1.1,
+            # Guided Filter: balanced
+            'guided_filter_radius': 4,
+            'guided_filter_eps': 1e-5,
         },
         'high': {
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
@@ -185,6 +210,13 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             'depth_process_res': 2048,  # Explicit high resolution (was None/auto)
             'depth_process_method': 'lower',  # process_res is min dimension
             'depth_norm_percentiles': (1.0, 99.0),  # Wider range preserves more detail
+            # Hair polish: preserve detail
+            'hair_gamma': 0.9,
+            'hair_black_point': 0.01,
+            'hair_gain': 1.05,
+            # Guided Filter: better hair strand separation
+            'guided_filter_radius': 2,
+            'guided_filter_eps': 1e-5,
         },
         'ultra': {
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
@@ -193,7 +225,14 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
             # DA3 settings: maximum detail capture
             'depth_process_res': 2048,  # Explicit high resolution
             'depth_process_method': 'lower',  # process_res is min dimension
-            'depth_norm_percentiles': (0.5, 99.5),  # Widest range for subtle details
+            'depth_norm_percentiles': (0.0, 100.0),  # Full range to preserve depth variation
+            # Hair polish: no adjustment (preserve all detail)
+            'hair_gamma': 1.0,
+            'hair_black_point': 0.0,
+            'hair_gain': 1.0,
+            # Guided Filter: maximum individual strand definition
+            'guided_filter_radius': 1,
+            'guided_filter_eps': 1e-6,
         }
     }
     return presets.get(quality, presets['standard'])
@@ -406,6 +445,30 @@ def run_pipeline(config: PipelineConfig):
         config.depth_process_method = preset['depth_process_method']
     if config.depth_norm_percentiles == (2.0, 98.0) and 'depth_norm_percentiles' in preset:
         config.depth_norm_percentiles = preset['depth_norm_percentiles']
+    # Apply hair polish settings from preset (unless overridden via CLI)
+    if config.hair_gamma is None and 'hair_gamma' in preset:
+        config.hair_gamma = preset['hair_gamma']
+    if config.hair_black_point is None and 'hair_black_point' in preset:
+        config.hair_black_point = preset['hair_black_point']
+    if config.hair_gain is None and 'hair_gain' in preset:
+        config.hair_gain = preset['hair_gain']
+    # Set defaults if still None (shouldn't happen with presets, but be safe)
+    if config.hair_gamma is None:
+        config.hair_gamma = 0.8
+    if config.hair_black_point is None:
+        config.hair_black_point = 0.02
+    if config.hair_gain is None:
+        config.hair_gain = 1.1
+    # Apply guided filter settings from preset (unless overridden via CLI)
+    if config.guided_filter_radius is None and 'guided_filter_radius' in preset:
+        config.guided_filter_radius = preset['guided_filter_radius']
+    if config.guided_filter_eps is None and 'guided_filter_eps' in preset:
+        config.guided_filter_eps = preset['guided_filter_eps']
+    # Set defaults if still None
+    if config.guided_filter_radius is None:
+        config.guided_filter_radius = 4
+    if config.guided_filter_eps is None:
+        config.guided_filter_eps = 1e-5
 
     # Auto-disable torch.compile on Windows unless forced
     if not config.no_compile and not config.force_compile and should_disable_compile():
@@ -533,10 +596,20 @@ def run_pipeline(config: PipelineConfig):
             "--adaptive-base", str(config.vitmatte_adaptive_base),
             "--adaptive-max", str(config.vitmatte_adaptive_max),
             "--save-trimap",
+            # Hair polish settings
+            "--hair-gamma", str(config.hair_gamma),
+            "--hair-black-point", str(config.hair_black_point),
+            "--hair-gain", str(config.hair_gain),
+            # Guided Filter settings
+            "--guided-radius", str(config.guided_filter_radius),
+            "--guided-eps", str(config.guided_filter_eps),
         ]
 
         if config.vitmatte_motion_aware:
             vitmatte_args.append("--motion-aware")
+
+        if not config.hair_polish_enabled:
+            vitmatte_args.append("--no-hair-polish")
 
         if config.verbose:
             vitmatte_args.append("--verbose")
@@ -702,9 +775,19 @@ def run_pipeline(config: PipelineConfig):
             "--bit-depth", str(config.bit_depth),
             "--adaptive-base", "2.0",
             "--adaptive-max", "60.0",
-            "--motion-aware", # Enable the motion logic
+            "--motion-aware",  # Enable the motion logic
             "--save-trimap",
+            # Hair polish settings
+            "--hair-gamma", str(config.hair_gamma),
+            "--hair-black-point", str(config.hair_black_point),
+            "--hair-gain", str(config.hair_gain),
+            # Guided Filter settings
+            "--guided-radius", str(config.guided_filter_radius),
+            "--guided-eps", str(config.guided_filter_eps),
         ]
+
+        if not config.hair_polish_enabled:
+            hair_args.append("--no-hair-polish")
 
         # Only run if we have frames (vitmatte needs frames folder, not video file)
         # Note: If input is a video file, you might need to point to the
@@ -744,6 +827,15 @@ def run_pipeline(config: PipelineConfig):
                 shutil.rmtree(dst)
             shutil.copytree(src, dst)
             logger.info(f"  Copied {subdir}/ to final output")
+
+    # Copy depth outputs (if available)
+    depth_src = depth_output / "depth"
+    if depth_src.exists():
+        depth_dst = final_output / "depth"
+        if depth_dst.exists():
+            shutil.rmtree(depth_dst)
+        shutil.copytree(depth_src, depth_dst)
+        logger.info("  Copied depth/ to final output")
 
     # Cleanup intermediate if not keeping
     if not config.keep_intermediate:
@@ -880,6 +972,22 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     parser.add_argument("--vitmatte-max", type=float, default=60.0,
                        help="Max unknown width for complex regions (default: 60)")
 
+    # Hair polish settings (for edge/unknown regions)
+    parser.add_argument("--hair-gamma", type=float, default=None,
+                       help="Hair edge gamma correction (0.5-1.0, lower=more visible, default: from quality preset)")
+    parser.add_argument("--hair-black-point", type=float, default=None,
+                       help="Hair black point threshold (0.0-0.1, lower=preserve faint tips, default: from quality preset)")
+    parser.add_argument("--hair-gain", type=float, default=None,
+                       help="Hair gain multiplier (1.0-1.5, higher=more solid, default: from quality preset)")
+    parser.add_argument("--no-hair-polish", action="store_true",
+                       help="Disable hair polish entirely (preserve raw ViTMatte output)")
+
+    # Guided Filter settings
+    parser.add_argument("--guided-radius", type=int, default=None,
+                       help="Guided filter radius (1-2 for hair, 4 for general, default: from quality preset)")
+    parser.add_argument("--guided-eps", type=float, default=None,
+                       help="Guided filter epsilon (lower=stricter edges, default: from quality preset)")
+
     # Edge settings
     parser.add_argument("--edge-softness", type=float, default=1.0,
                        help="Edge softness (default: 1.0)")
@@ -949,6 +1057,14 @@ def main():
         vitmatte_motion_aware=args.vitmatte_motion,
         vitmatte_adaptive_base=args.vitmatte_base,
         vitmatte_adaptive_max=args.vitmatte_max,
+        # Hair polish settings (None = use quality preset)
+        hair_gamma=args.hair_gamma,
+        hair_black_point=args.hair_black_point,
+        hair_gain=args.hair_gain,
+        hair_polish_enabled=not args.no_hair_polish,
+        # Guided Filter settings (None = use quality preset)
+        guided_filter_radius=args.guided_radius,
+        guided_filter_eps=args.guided_eps,
         edge_softness=args.edge_softness,
         core_shrink=args.core_shrink,
         despill_strength=args.despill,

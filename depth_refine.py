@@ -1029,8 +1029,7 @@ class DepthGuidedRefiner:
         depth_normalized = np.clip((hair_local_max - depth) / depth_range, 0, 1)
 
         # Contrast curve to enhance hair strand visibility
-        depth_contrasted = depth_normalized ** 0.5
-        depth_contrasted = np.clip(depth_contrasted * 1.3 - 0.15, 0, 1)
+        depth_contrasted = depth_normalized ** 0.8
 
         # Apply validity mask
         depth_as_alpha = depth_contrasted * valid_pixels.astype(np.float32)
@@ -1707,11 +1706,15 @@ class DepthRefinePipeline:
                         mask=alpha  # Only process tiles near the subject (for tiled models)
                     )
 
-                    # Enhance foreground depth detail using mask
-                    # This expands the depth range within the subject for better hair/detail detection
-                    depth = self.depth_estimator.normalize_for_foreground(
-                        depth, alpha, foreground_range=(0.0, 0.7)
-                    )
+                    # Enhance foreground depth detail using mask unless preserving full depth range
+                    # Full-range percentiles (0-100) should keep depth values intact
+                    p_low, p_high = self.config.depth_norm_percentiles
+                    if p_low <= 0.0 and p_high >= 100.0:
+                        self.logger.debug("Preserving full depth range - skipping foreground normalization")
+                    else:
+                        depth = self.depth_estimator.normalize_for_foreground(
+                            depth, alpha, foreground_range=(0.0, 0.7)
+                        )
 
                     if self.config.save_depth:
                         # Save float EXR for actual depth data (for reuse/processing)

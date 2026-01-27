@@ -132,6 +132,18 @@ class GeometricMatteConfig:
     trimap: TrimapConfig = field(default_factory=TrimapConfig)
     vitmatte: ViTMatteConfig = field(default_factory=ViTMatteConfig)
 
+    # Hair detail polish (applied to unknown/edge regions only)
+    # Previous aggressive values: gamma=0.5, black_point=0.05, gain=1.4
+    # New softer defaults preserve sub-pixel hair transparency
+    hair_gamma: float = 0.8           # Closer to 1.0 preserves gradients (was 0.5)
+    hair_black_point: float = 0.02    # Lower preserves faint tips (was 0.05)
+    hair_gain: float = 1.1            # Less aggressive solidification (was 1.4)
+    hair_polish_enabled: bool = True  # Allow disabling entirely
+
+    # Guided Filter settings (edge-aware smoothing)
+    guided_filter_radius: int = 4         # 1-2 for hair, 4 for bodies/clothes
+    guided_filter_eps: float = 1e-5       # Lower = stricter edge adherence (1e-6 for hair)
+
     # Output
     output_dir: str = "./vitmatte_output"
     output_format: str = "exr"
@@ -1355,35 +1367,40 @@ class GeometricMatteRefiner:
                 rgb_linear = srgb_to_linear(rgb.astype(np.float32) / 255.0)
 
                 # Guided Filter
-                # Radius 4 is cleaner for high-res footage than 2
+                # radius: 1-2 for hair detail, 4 for general/bodies
+                # eps: 1e-6 for strict edges (hair), 1e-5 general
                 alpha_refined = ximgproc.guidedFilter(
                     guide=rgb_linear,
                     src=alpha.astype(np.float32),
-                    radius=4,    # Smooths the blockiness
-                    eps=1e-5     # Slightly tighter edge adherence
+                    radius=self.config.guided_filter_radius,
+                    eps=self.config.guided_filter_eps
                 )
 
                 # =====================================================================
-                # STAGE 3.5: HAIR DENSITY & POLISH (The "Punch" Configuration)
+                # STAGE 3.5: HAIR DENSITY & POLISH (Configurable)
                 # =====================================================================
                 # Only apply this to the "Unknown" region (hair/edges)
+                # Parameters are now configurable via GeometricMatteConfig
                 detail_region = (trimap == 128)
 
-                if np.any(detail_region):
+                if np.any(detail_region) and self.config.hair_polish_enabled:
                     # 1. Extract the detail alpha
                     hair_alpha = alpha_refined[detail_region]
 
-                    # 2. GAMMA: 0.5 (Square Root) - THE KEY TO DETAIL
-                    # Turns faint 25% opacity strands into 50% visible strands
-                    hair_alpha = np.power(hair_alpha, 0.5)
+                    # 2. GAMMA: Apply configurable gamma correction
+                    # Lower values (<1.0) boost faint strands (0.5=aggressive, 1.0=none)
+                    if self.config.hair_gamma != 1.0:
+                        hair_alpha = np.power(hair_alpha, self.config.hair_gamma)
 
-                    # 3. BLACK POINT: 0.05 (Aggressive Cleanup)
-                    # Kills the background noise boosted by the gamma
-                    hair_alpha = np.maximum(0, hair_alpha - 0.05)
+                    # 3. BLACK POINT: Apply configurable threshold
+                    # Removes noise but can destroy faint tips if too aggressive
+                    if self.config.hair_black_point > 0:
+                        hair_alpha = np.maximum(0, hair_alpha - self.config.hair_black_point)
 
-                    # 4. GAIN: 1.4 (Solidify)
-                    # Forces the "spine" of the curl to be 100% white
-                    hair_alpha = hair_alpha * 1.4
+                    # 4. GAIN: Apply configurable gain multiplier
+                    # Solidifies the core of strands (1.0=none, higher=more solid)
+                    if self.config.hair_gain != 1.0:
+                        hair_alpha = hair_alpha * self.config.hair_gain
 
                     # Write back
                     alpha_refined[detail_region] = hair_alpha
@@ -1627,6 +1644,22 @@ EXAMPLES:
     parser.add_argument("--max-resolution", type=int, default=8192,
                        help="Max resolution for processing (resize if larger, default: 8192)")
 
+    # Hair polish settings (for edge/unknown regions)
+    parser.add_argument("--hair-gamma", type=float, default=0.8,
+                       help="Hair edge gamma correction (0.5-1.0, lower=more visible, default: 0.8)")
+    parser.add_argument("--hair-black-point", type=float, default=0.02,
+                       help="Hair black point threshold (0.0-0.1, lower=preserve faint tips, default: 0.02)")
+    parser.add_argument("--hair-gain", type=float, default=1.1,
+                       help="Hair gain multiplier (1.0-1.5, higher=more solid, default: 1.1)")
+    parser.add_argument("--no-hair-polish", action="store_true",
+                       help="Disable hair polish entirely (preserve raw ViTMatte output)")
+
+    # Guided Filter settings
+    parser.add_argument("--guided-radius", type=int, default=4,
+                       help="Guided filter radius (1-2 for hair detail, 4 for general, default: 4)")
+    parser.add_argument("--guided-eps", type=float, default=1e-5,
+                       help="Guided filter epsilon (1e-6 for hair, 1e-5 general, default: 1e-5)")
+
     # Output settings
     parser.add_argument("--format", choices=["exr", "png"], default="exr",
                        help="Output format (default: exr)")
@@ -1688,6 +1721,15 @@ def main():
             device=args.device,
             max_resolution=args.max_resolution,
         ),
+        # Hair polish settings
+        hair_gamma=args.hair_gamma,
+        hair_black_point=args.hair_black_point,
+        hair_gain=args.hair_gain,
+        hair_polish_enabled=not args.no_hair_polish,
+        # Guided Filter settings
+        guided_filter_radius=args.guided_radius,
+        guided_filter_eps=args.guided_eps,
+        # Output settings
         output_dir=args.output,
         output_format=args.format,
         bit_depth=args.bit_depth,
