@@ -536,10 +536,15 @@ class DepthEstimator:
                     padded = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
                     padded[:tile_h, :tile_w] = tile
                     # Mirror padding for better edge handling
+                    # Use available rows/columns, not the missing amount
                     if tile_h < tile_size:
-                        padded[tile_h:, :tile_w] = tile[-(tile_size-tile_h):, :][::-1]
+                        # Mirror available rows to fill bottom
+                        mirror_h = min(tile_h, tile_size - tile_h)
+                        padded[tile_h:tile_h + mirror_h, :tile_w] = tile[tile_h - mirror_h:tile_h, :][::-1]
                     if tile_w < tile_size:
-                        padded[:tile_h, tile_w:] = tile[:, -(tile_size-tile_w):][:, ::-1]
+                        # Mirror available columns to fill right
+                        mirror_w = min(tile_w, tile_size - tile_w)
+                        padded[:tile_h, tile_w:tile_w + mirror_w] = tile[:, tile_w - mirror_w:tile_w][:, ::-1]
                     tile = padded
 
                 # Estimate depth for this tile
