@@ -51,7 +51,7 @@ import time
 import platform
 from pathlib import Path
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
 
@@ -273,6 +273,68 @@ def clear_gpu_memory():
     logger.debug("GPU memory cleared")
 
 
+def resolve_frames_dir(
+    input_path: str,
+    output_dir: Path,
+    logger: logging.Logger
+) -> Tuple[Optional[Path], bool]:
+    """Resolve or extract RGB frames for stages that require frame sequences."""
+    input_path = Path(input_path)
+
+    if input_path.is_dir():
+        return input_path, False
+
+    image_exts = {".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".dpx"}
+    if input_path.is_file() and input_path.suffix.lower() in image_exts:
+        return input_path.parent, False
+
+    if "#" in str(input_path) or "*" in str(input_path):
+        if input_path.parent.exists():
+            return input_path.parent, False
+
+    video_exts = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".mxf"}
+    if input_path.is_file() and input_path.suffix.lower() in video_exts:
+        frames_dir = output_dir / "00_frames"
+
+        if frames_dir.exists():
+            existing = sorted(list(frames_dir.glob("*.png")) +
+                              list(frames_dir.glob("*.jpg")) +
+                              list(frames_dir.glob("*.jpeg")))
+            if existing:
+                logger.info(f"Using existing extracted frames: {frames_dir}")
+                return frames_dir, True
+            shutil.rmtree(frames_dir, ignore_errors=True)
+
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        import cv2
+        cap = cv2.VideoCapture(str(input_path))
+        if not cap.isOpened():
+            logger.error(f"Cannot open video for frame extraction: {input_path}")
+            return None, True
+
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_path = frames_dir / f"frame.{idx:06d}.jpg"
+            cv2.imwrite(str(frame_path), frame)
+            idx += 1
+
+        cap.release()
+
+        if idx == 0:
+            logger.error(f"No frames extracted from video: {input_path}")
+            return None, True
+
+        logger.info(f"Extracted {idx} frames to: {frames_dir}")
+        return frames_dir, True
+
+    return None, False
+
+
 def run_stage(cmd: list, stage_name: str, verbose: bool = False) -> bool:
     """Run a pipeline stage and return success status."""
     logger.info(f"\n{'='*60}")
@@ -479,6 +541,17 @@ def run_pipeline(config: PipelineConfig):
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    frames_dir, frames_is_temp = resolve_frames_dir(
+        config.input_path,
+        output_dir,
+        logger
+    )
+    if frames_is_temp and frames_dir is None:
+        logger.error("Failed to prepare frames for processing; aborting pipeline.")
+        return False
+
+    frames_arg = str(frames_dir) if frames_dir else config.input_path
+
     # Intermediate directories
     sam_output = output_dir / "01_sam_output"
     depth_output = output_dir / "02_depth_output"
@@ -534,7 +607,7 @@ def run_pipeline(config: PipelineConfig):
 
         depth_args = [
             "--alpha", str(alpha_source),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--output", str(depth_output),
             "--depth-model", config.depth_model,
             "--format", config.output_format,
@@ -588,7 +661,7 @@ def run_pipeline(config: PipelineConfig):
         vitmatte_args = [
             "--sam-mask", str(sam_alpha),
             "--depth", str(depth_maps),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--output", str(vitmatte_output),
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
@@ -642,7 +715,7 @@ def run_pipeline(config: PipelineConfig):
         edge_args = [
             "--alpha", str(alpha_source),
             "--output", str(edge_output),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--softness", str(config.edge_softness),
             "--core-shrink", str(config.core_shrink),
             "--despill", str(config.despill_strength),
@@ -681,7 +754,7 @@ def run_pipeline(config: PipelineConfig):
         temporal_args = [
             "--alpha", str(alpha_source),
             "--output", str(temporal_output),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--window", str(config.temporal_window),
             "--keyframe-interval", str(config.keyframe_interval),
             "--format", config.output_format,
@@ -719,7 +792,7 @@ def run_pipeline(config: PipelineConfig):
         combine_args = [
             "--alpha", str(alpha_source),
             "--output", str(combine_output),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--core-erosion", str(config.core_shrink),
             "--despill", str(config.despill_strength),
             "--format", config.output_format,
@@ -769,7 +842,7 @@ def run_pipeline(config: PipelineConfig):
         hair_args = [
             "--sam-mask", str(sam_alpha),
             "--depth", str(depth_maps),
-            "--frames", config.input_path,
+            "--frames", frames_arg,
             "--output", str(hair_output),
             "--format", config.output_format,
             "--bit-depth", str(config.bit_depth),
@@ -844,6 +917,8 @@ def run_pipeline(config: PipelineConfig):
                            temporal_output, combine_output]:
             if intermediate.exists() and intermediate != final_output:
                 shutil.rmtree(intermediate, ignore_errors=True)
+        if frames_is_temp and frames_dir and frames_dir.exists():
+            shutil.rmtree(frames_dir, ignore_errors=True)
 
     # =========================================================================
     # SUMMARY

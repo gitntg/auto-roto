@@ -30,6 +30,8 @@ USAGE:
 
 import os
 import sys
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
 import argparse
 import logging
 from pathlib import Path
@@ -421,11 +423,16 @@ def save_alpha(alpha: np.ndarray, path: Path, bit_depth: int = 16):
             exr = OpenEXR.OutputFile(str(path), header)
             exr.writePixels({'Y': alpha.astype(np.float32).tobytes()})
             exr.close()
+            return
         except ImportError:
-            # Fallback to PNG
-            path = path.with_suffix('.png')
-            alpha_uint16 = (alpha * 65535).astype(np.uint16)
-            cv2.imwrite(str(path), alpha_uint16)
+            pass
+
+        if cv2.imwrite(str(path), alpha.astype(np.float32)):
+            return
+
+        path = path.with_suffix('.png')
+        alpha_uint16 = (alpha * 65535).astype(np.uint16)
+        cv2.imwrite(str(path), alpha_uint16)
     else:
         if bit_depth == 16:
             alpha_int = (alpha * 65535).astype(np.uint16)

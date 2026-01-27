@@ -1532,6 +1532,11 @@ def save_alpha(alpha: np.ndarray, path: Path, bit_depth: int = 16):
         except ImportError:
             pass
 
+        if cv2.imwrite(str(path), alpha.astype(np.float32)):
+            return
+
+        path = path.with_suffix('.png')
+
     # Fallback to OpenCV
     if bit_depth == 16:
         alpha_int = (alpha * 65535).astype(np.uint16)

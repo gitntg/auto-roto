@@ -36,6 +36,10 @@ Author: AUTO-ROTO v5 Enhancement
 License: MIT
 """
 
+import os
+
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
 import numpy as np
 import cv2
 import logging
@@ -954,7 +958,12 @@ class TemporalSmoothPipeline:
                 exr.close()
                 return
             except ImportError:
-                path = path.with_suffix('.png')
+                pass
+
+            if cv2.imwrite(str(path), alpha.astype(np.float32)):
+                return
+
+            path = path.with_suffix('.png')
 
         if self.bit_depth == 16:
             alpha_int = (alpha * 65535).astype(np.uint16)
