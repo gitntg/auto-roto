@@ -31,6 +31,9 @@ USAGE:
     # Ultra quality + hair detail (max quality, slower)
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality ultra --with-hair --depth-res 2048 --depth-method lower --depth-percentiles 0 100 --use-depth-confidence --vitmatte-motion
 
+    # MatAnyone2 refinement (Stage 3 replacement)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --refiner mam2
+
     # Fast preview (draft quality, no temporal)
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
 
@@ -110,10 +113,17 @@ class PipelineConfig:
     skip_combine: bool = False
     skip_hair: bool = True  # Hair refinement optional, off by default
 
+    # Alpha refinement selection
+    refiner: str = "vitmatte"  # vitmatte or mam2
+
     # ViTMatte settings (adaptive trimap)
     vitmatte_motion_aware: bool = False
     vitmatte_adaptive_base: float = 2.0
     vitmatte_adaptive_max: float = 60.0
+
+    # MatAnyone2 settings
+    mam2_repo: str = "MatAnyone2"
+    mam2_checkpoint: str = "./checkpoints/mam2.pth"
 
     # Hair polish settings (applied to edge/unknown regions)
     # None = use quality preset value; explicit values override preset
@@ -555,7 +565,8 @@ def run_pipeline(config: PipelineConfig):
     # Intermediate directories
     sam_output = output_dir / "01_sam_output"
     depth_output = output_dir / "02_depth_output"
-    vitmatte_output = output_dir / "03_vitmatte_output"
+    refine_stage_dir = "03_mam2_output" if config.refiner == "mam2" else "03_vitmatte_output"
+    vitmatte_output = output_dir / refine_stage_dir
     edge_output = output_dir / "04_edge_output"
     temporal_output = output_dir / "05_temporal_output"
     combine_output = output_dir / "06_combine_output"
@@ -576,6 +587,7 @@ def run_pipeline(config: PipelineConfig):
     sam_imgsz_str = f"{config.sam_imgsz}" if config.sam_imgsz > 0 else "auto"
     logger.info(f"SAM3: imgsz={sam_imgsz_str}, conf={config.sam_conf}, retina={config.sam_retina_masks}")
     logger.info(f"Depth Model: {config.depth_model}")
+    logger.info(f"Refiner: {config.refiner}")
     logger.info("="*60)
 
     # =========================================================================
@@ -644,61 +656,76 @@ def run_pipeline(config: PipelineConfig):
         depth_output = sam_output
 
     # =========================================================================
-    # STAGE 3: ViTMatte Alpha Refinement (Adaptive Trimap)
+    # STAGE 3: Alpha Refinement (ViTMatte or MatAnyone2)
     # =========================================================================
     if not config.skip_vitmatte:
-        vitmatte_script = find_script("vitmatte_refine.py")
-
         # Determine sources
         sam_alpha = sam_output / "alpha"
         if not sam_alpha.exists():
             sam_alpha = sam_output
 
-        depth_maps = depth_output / "depth"
-        if not depth_maps.exists():
-            depth_maps = depth_output
+        if config.refiner == "mam2":
+            refine_script = find_script("mam2_refine.py")
+            refine_args = [
+                "--sam-mask", str(sam_alpha),
+                "--frames", frames_arg,
+                "--output", str(vitmatte_output),
+                "--checkpoint", config.mam2_checkpoint,
+                "--repo", config.mam2_repo,
+                "--format", config.output_format,
+                "--bit-depth", str(config.bit_depth),
+                "--device", config.device,
+            ]
+            stage_name = "MatAnyone2 Refinement"
+        else:
+            refine_script = find_script("vitmatte_refine.py")
 
-        vitmatte_args = [
-            "--sam-mask", str(sam_alpha),
-            "--depth", str(depth_maps),
-            "--frames", frames_arg,
-            "--output", str(vitmatte_output),
-            "--format", config.output_format,
-            "--bit-depth", str(config.bit_depth),
-            "--core-erosion", "10",
-            "--adaptive-base", str(config.vitmatte_adaptive_base),
-            "--adaptive-max", str(config.vitmatte_adaptive_max),
-            "--save-trimap",
-            # Hair polish settings
-            "--hair-gamma", str(config.hair_gamma),
-            "--hair-black-point", str(config.hair_black_point),
-            "--hair-gain", str(config.hair_gain),
-            # Guided Filter settings
-            "--guided-radius", str(config.guided_filter_radius),
-            "--guided-eps", str(config.guided_filter_eps),
-        ]
+            depth_maps = depth_output / "depth"
+            if not depth_maps.exists():
+                depth_maps = depth_output
 
-        if config.vitmatte_motion_aware:
-            vitmatte_args.append("--motion-aware")
+            refine_args = [
+                "--sam-mask", str(sam_alpha),
+                "--depth", str(depth_maps),
+                "--frames", frames_arg,
+                "--output", str(vitmatte_output),
+                "--format", config.output_format,
+                "--bit-depth", str(config.bit_depth),
+                "--core-erosion", "10",
+                "--adaptive-base", str(config.vitmatte_adaptive_base),
+                "--adaptive-max", str(config.vitmatte_adaptive_max),
+                "--save-trimap",
+                # Hair polish settings
+                "--hair-gamma", str(config.hair_gamma),
+                "--hair-black-point", str(config.hair_black_point),
+                "--hair-gain", str(config.hair_gain),
+                # Guided Filter settings
+                "--guided-radius", str(config.guided_filter_radius),
+                "--guided-eps", str(config.guided_filter_eps),
+            ]
+            stage_name = "ViTMatte Alpha Refinement"
 
-        if not config.hair_polish_enabled:
-            vitmatte_args.append("--no-hair-polish")
+            if config.vitmatte_motion_aware:
+                refine_args.append("--motion-aware")
+
+            if not config.hair_polish_enabled:
+                refine_args.append("--no-hair-polish")
 
         if config.verbose:
-            vitmatte_args.append("--verbose")
+            refine_args.append("--verbose")
 
         success = run_python_stage(
-            vitmatte_script, vitmatte_args,
-            "ViTMatte Alpha Refinement", config.verbose
+            refine_script, refine_args,
+            stage_name, config.verbose
         )
 
         if not success:
-            logger.warning("ViTMatte refinement failed, continuing with depth output")
+            logger.warning(f"{stage_name} failed, continuing with depth output")
             vitmatte_output = depth_output
 
         clear_gpu_memory()
     else:
-        logger.info("Skipping ViTMatte (--skip-vitmatte)")
+        logger.info("Skipping Alpha Refinement (--skip-vitmatte)")
         vitmatte_output = depth_output
 
     # =========================================================================
@@ -707,7 +734,7 @@ def run_pipeline(config: PipelineConfig):
     if not config.skip_edge:
         edge_script = find_script("edge_refine.py")
 
-        # Determine alpha source (now from ViTMatte)
+        # Determine alpha source (now from refinement stage)
         alpha_source = vitmatte_output / "alpha"
         if not alpha_source.exists():
             alpha_source = vitmatte_output
@@ -1001,7 +1028,7 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     parser.add_argument("--skip-depth", action="store_true",
                        help="Skip depth refinement")
     parser.add_argument("--skip-vitmatte", action="store_true",
-                       help="Skip ViTMatte alpha refinement")
+                       help="Skip alpha refinement stage (ViTMatte/MatAnyone2)")
     parser.add_argument("--skip-edge", action="store_true",
                        help="Skip edge refinement")
     parser.add_argument("--skip-temporal", action="store_true",
@@ -1010,6 +1037,14 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
                        help="Skip matte combination")
     parser.add_argument("--with-hair", action="store_true",
                        help="Enable hair refinement (off by default)")
+
+    # Alpha refinement selection
+    parser.add_argument("--refiner", choices=["vitmatte", "mam2"], default="vitmatte",
+                       help="Alpha refinement model (default: vitmatte)")
+    parser.add_argument("--mam2-checkpoint", default="./checkpoints/mam2.pth",
+                       help="MatAnyone2 checkpoint path")
+    parser.add_argument("--mam2-repo", default="MatAnyone2",
+                       help="MatAnyone2 repo path (relative or absolute)")
 
     # SAM3 settings
     parser.add_argument("--sam-imgsz", type=int, default=0,
@@ -1117,6 +1152,9 @@ def main():
         skip_temporal=args.skip_temporal,
         skip_combine=args.skip_combine,
         skip_hair=not args.with_hair,
+        refiner=args.refiner,
+        mam2_repo=args.mam2_repo,
+        mam2_checkpoint=args.mam2_checkpoint,
         depth_model=args.depth_model or "",
         # DA3 depth sensitivity settings
         depth_process_res=args.depth_res,
