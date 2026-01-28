@@ -9,6 +9,7 @@
 Built on SAM2 (Segment Anything Model 2.1) with ViTMatte for fine detail matting, Depth Anything V3 for edge refinement, and professional VFX quality enhancements.
 
 ---
+Path to full : F:/3DActive/CarCrash/reel-new/renders/scene-01nfp/
 
 ## Features
 

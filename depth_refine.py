@@ -111,6 +111,7 @@ class DepthRefineConfig:
     depth_model: str = "large"    # large (DA3Mono) best for hair detail; nested smooths fine detail
     compute_depth: bool = True    # Compute depth if not provided
     save_depth: bool = True       # Save depth maps for reuse
+    depth_only: bool = True       # ONLY output depth - no alpha refinement (pure depth mode)
 
     # DA3 Resolution Settings (NEW)
     # These control how DA3 processes images for fine detail capture
@@ -490,7 +491,7 @@ class DepthEstimator:
                 tile_size = DEPTH_DEFAULT_TILE_SIZE
 
         if overlap is None:
-            overlap = tile_size // 4  # 25% overlap for smooth blending
+            overlap = tile_size // 2  # 50% overlap for seamless blending (was 25%)
 
         self.logger.debug(f"High-res depth: tile_size={tile_size}, overlap={overlap}, image={w}x{h}")
 
@@ -503,18 +504,30 @@ class DepthEstimator:
         depth_sum = np.zeros((h, w), dtype=np.float64)
         weight_sum = np.zeros((h, w), dtype=np.float64)
 
-        # Create weight mask for blending (feathered edges)
+        # Create weight mask for blending (smooth cosine feathered edges)
         def create_weight_mask(th, tw):
-            """Create a weight mask with feathered edges for blending."""
-            mask_w = np.ones((th, tw), dtype=np.float32)
-            feather = min(overlap // 2, th // 4, tw // 4)
-            if feather > 0:
-                for i in range(feather):
-                    weight = (i + 1) / feather
-                    mask_w[i, :] *= weight
-                    mask_w[-(i+1), :] *= weight
-                    mask_w[:, i] *= weight
-                    mask_w[:, -(i+1)] *= weight
+            """Create a weight mask with smooth cosine-feathered edges for seamless blending."""
+            # Use full overlap as feather zone for smoother transitions
+            feather = min(overlap, th // 2, tw // 2)
+            if feather <= 0:
+                return np.ones((th, tw), dtype=np.float32)
+            
+            # Create 1D cosine ramps (smoother than linear)
+            def cosine_ramp(length, feather_size):
+                ramp = np.ones(length, dtype=np.float32)
+                if feather_size > 0 and length > 2 * feather_size:
+                    # Smooth cosine fade at edges: 0 -> 1 over feather zone
+                    t = np.linspace(0, np.pi / 2, feather_size)
+                    fade_in = np.sin(t) ** 2  # Smooth S-curve
+                    ramp[:feather_size] = fade_in
+                    ramp[-feather_size:] = fade_in[::-1]
+                return ramp
+            
+            # Create 2D weight mask from outer product of 1D ramps
+            ramp_h = cosine_ramp(th, feather)
+            ramp_w = cosine_ramp(tw, feather)
+            mask_w = np.outer(ramp_h, ramp_w).astype(np.float32)
+            
             return mask_w
 
         # Calculate tile grid
@@ -576,6 +589,11 @@ class DepthEstimator:
 
         # Normalize to 0-1
         depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+
+        # Post-process: Edge-preserving smoothing to reduce noise in uniform regions
+        # Bilateral filter preserves depth edges while smoothing noise
+        # Use float32 directly for full precision (sigmaColor in 0-1 range)
+        depth = cv2.bilateralFilter(depth, d=9, sigmaColor=0.1, sigmaSpace=25)
 
         self.logger.info(f"High-res depth: processed {tiles_processed} tiles at {tile_size}x{tile_size}")
 
@@ -1506,14 +1524,32 @@ def save_depth_visualization(
     filepath: Path,
     colormap: bool = True
 ):
-    """Save depth map as colorized visualization (for preview only)."""
+    """Save depth map as colorized visualization (for preview only).
+    
+    Uses 16-bit output to minimize banding artifacts in gradients.
+    """
     import cv2
 
-    # Normalize
-    depth_vis = (depth * 255).astype(np.uint8)
-
     if colormap:
-        depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
+        # Use matplotlib's colormap for smooth gradients
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.cm as cm
+            
+            # Apply inferno colormap with full float precision
+            cmap = cm.get_cmap('inferno')
+            depth_colored = cmap(depth)  # Returns RGBA float [0,1]
+            
+            # Convert to BGR 16-bit for minimal banding (65536 levels per channel)
+            depth_vis = (depth_colored[:, :, :3] * 65535).astype(np.uint16)
+            depth_vis = depth_vis[:, :, ::-1]  # RGB to BGR
+            
+        except ImportError:
+            # Fallback: grayscale 16-bit if matplotlib unavailable
+            depth_vis = (depth * 65535).astype(np.uint16)
+    else:
+        # Grayscale 16-bit (no colormap)
+        depth_vis = (depth * 65535).astype(np.uint16)
 
     cv2.imwrite(str(filepath), depth_vis)
 
@@ -1699,22 +1735,8 @@ class DepthRefinePipeline:
 
                     self.logger.debug(f"  Computing depth from {frame_path.name}...")
                     self.logger.debug(f"  Model: {self.config.depth_model}")
-                    # Use high-res depth estimation
-                    # Nested models process directly; others use tiling
-                    depth = self.depth_estimator.estimate_high_res(
-                        frame,
-                        mask=alpha  # Only process tiles near the subject (for tiled models)
-                    )
-
-                    # Enhance foreground depth detail using mask unless preserving full depth range
-                    # Full-range percentiles (0-100) should keep depth values intact
-                    p_low, p_high = self.config.depth_norm_percentiles
-                    if p_low <= 0.0 and p_high >= 100.0:
-                        self.logger.debug("Preserving full depth range - skipping foreground normalization")
-                    else:
-                        depth = self.depth_estimator.normalize_for_foreground(
-                            depth, alpha, foreground_range=(0.0, 0.7)
-                        )
+                    # Use high-res depth estimation (pure depth, no alpha influence)
+                    depth = self.depth_estimator.estimate_high_res(frame)
 
                     if self.config.save_depth:
                         # Save float EXR for actual depth data (for reuse/processing)
@@ -1727,21 +1749,23 @@ class DepthRefinePipeline:
                     self.logger.warning(f"No frame for depth computation at index {idx} (have {len(frame_files)} frames), skipping")
                     continue
 
-            # Refine alpha - pass RGB frame for guided filtering
-            self.logger.debug(f"  Refining alpha with hair detection...")
-            rgb_for_refine = frame if 'frame' in locals() else None
-            refined = self.refiner.refine(alpha, depth, rgb=rgb_for_refine)
-            
-            # Save refined alpha
-            output_path = refined_dir / f"refined.{idx:04d}.{self.config.output_format}"
-            save_alpha(refined, output_path, self.config.bit_depth)
-            
-            # Save debug visualization
-            if self.config.save_debug:
-                self._save_debug_vis(
-                    alpha, depth, refined,
-                    debug_dir / f"debug.{idx:04d}.jpg"
-                )
+            # Skip alpha refinement if depth_only mode (pure depth output)
+            if not self.config.depth_only:
+                # Refine alpha - pass RGB frame for guided filtering
+                self.logger.debug(f"  Refining alpha with hair detection...")
+                rgb_for_refine = frame if 'frame' in locals() else None
+                refined = self.refiner.refine(alpha, depth, rgb=rgb_for_refine)
+                
+                # Save refined alpha
+                output_path = refined_dir / f"refined.{idx:04d}.{self.config.output_format}"
+                save_alpha(refined, output_path, self.config.bit_depth)
+                
+                # Save debug visualization
+                if self.config.save_debug:
+                    self._save_debug_vis(
+                        alpha, depth, refined,
+                        debug_dir / f"debug.{idx:04d}.jpg"
+                    )
             
             if idx % 10 == 0:
                 self.logger.info(f"  Processed {idx} frames...")
@@ -1890,6 +1914,10 @@ EXAMPLES:
                        help="Depth Anything 3 model (large=DA3Mono best for hair detail)")
     parser.add_argument("--no-save-depth", action="store_true",
                        help="Don't save computed depth maps")
+    parser.add_argument("--depth-only", action="store_true", default=True,
+                       help="Output ONLY depth maps - no alpha refinement (default: True)")
+    parser.add_argument("--refine-alpha", action="store_true",
+                       help="Enable alpha refinement using depth (disables depth-only mode)")
 
     # DA3 Resolution/Sensitivity Settings (NEW)
     parser.add_argument("--depth-res", type=int, default=None,
@@ -1945,6 +1973,9 @@ EXAMPLES:
 def main():
     args = parse_args()
 
+    # depth_only is True by default; --refine-alpha disables it
+    depth_only = not args.refine_alpha
+
     config = DepthRefineConfig(
         alpha_dir=args.alpha,
         frames_dir=args.frames or "",
@@ -1953,6 +1984,7 @@ def main():
         output_dir=args.output,
         depth_model=args.depth_model,
         save_depth=not args.no_save_depth,
+        depth_only=depth_only,  # Pure depth mode (no alpha refinement)
         # DA3 sensitivity settings (NEW)
         depth_process_res=args.depth_res,
         depth_process_method=args.depth_method,

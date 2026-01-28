@@ -7,19 +7,16 @@ Production-grade automatic rotoscoping with professional quality enhancements.
 
 This is the main entry point for v5 which chains:
     1. SAM3 segmentation with built-in text prompting (auto_roto.py)
-    2. Depth Anything V2 refinement (depth_refine.py)
-    3. Edge refinement (edge_refine.py)
-    4. Temporal coherence (temporal_smooth.py)
-    5. Matte combination (matte_combine.py)
-    6. (Optional) Hair refinement (hair_refine.py)
+    2. Depth Anything V3 refinement (depth_refine.py)
+    3. Alpha refinement - ViTMatte or MatAnyone1 (vitmatte_refine.py / mam2_refine.py)
+    4. Matte combination (matte_combine.py)
+    5. (Optional) Hair refinement (vitmatte_refine.py)
 
 SAM3 has native Promptable Concept Segmentation (PCS) supporting 270k+ concepts,
 eliminating the need for separate detection (GroundingDINO).
 
 NEW IN V5:
 - SAM3 with built-in text prompting (no GroundingDINO needed)
-- Professional edge refinement with subpixel precision
-- Temporal coherence to prevent flickering
 - Multi-layer matte combination
 - Color correction and despill
 - Proper premultiplied alpha compositing
@@ -31,14 +28,14 @@ USAGE:
     # Ultra quality + hair detail (max quality, slower)
     python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality ultra --with-hair --depth-res 2048 --depth-method lower --depth-percentiles 0 100 --use-depth-confidence --vitmatte-motion
 
-    # MatAnyone2 refinement (Stage 3 replacement)
-    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --refiner mam2
+    # MatAnyone1 refinement (Stage 3 replacement)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --refiner ma1
 
-    # Fast preview (draft quality, no temporal)
-    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
+    # Fast preview (draft quality)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality draft
 
     # Process PNG sequence (ultra quality)
-    python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output --quality ultra --with-hair
+    python full_pipeline_v5.py --input /path/to/frames/ --prompt "person" --output ./output --quality ultra --with-hair
 
 Author: AUTO-ROTO v5
 License: MIT
@@ -100,6 +97,7 @@ class PipelineConfig:
     prompt: str = ""
     box: str = ""
     interactive: bool = False
+    interactive_points: bool = False  # Include/exclude point marking mode
 
     # Quality preset
     quality: str = "standard"  # draft, standard, high, ultra
@@ -108,22 +106,23 @@ class PipelineConfig:
     skip_sam: bool = False
     skip_depth: bool = False
     skip_vitmatte: bool = False  # ViTMatte alpha refinement
-    skip_edge: bool = False
-    skip_temporal: bool = False
+    # Edge refinement and temporal smoothing removed from pipeline
+    # (they were destructively replacing alpha values)
     skip_combine: bool = False
     skip_hair: bool = True  # Hair refinement optional, off by default
+    clean_output: bool = False  # Clear output directories before running
 
     # Alpha refinement selection
-    refiner: str = "vitmatte"  # vitmatte or mam2
+    refiner: str = "vitmatte"  # vitmatte or ma1 (MatAnyone1)
 
     # ViTMatte settings (adaptive trimap)
     vitmatte_motion_aware: bool = False
     vitmatte_adaptive_base: float = 2.0
     vitmatte_adaptive_max: float = 60.0
 
-    # MatAnyone2 settings
-    mam2_repo: str = "MatAnyone2"
-    mam2_checkpoint: str = "./checkpoints/mam2.pth"
+    # MatAnyone1 settings
+    mam2_repo: str = "./MatAnyone"
+    mam2_checkpoint: str = "./checkpoints/matanyone.pth"
 
     # Hair polish settings (applied to edge/unknown regions)
     # None = use quality preset value; explicit values override preset
@@ -150,15 +149,15 @@ class PipelineConfig:
     depth_process_method: str = "upper"   # "upper" or "lower" bound resize
     depth_norm_percentiles: tuple = (2.0, 98.0)  # Normalization percentiles
     use_depth_confidence: bool = False     # Use DA3 confidence maps
+    
+    # Pure depth pass (runs BEFORE SAM, no alpha input)
+    depth_first: bool = False             # Run pure depth pass before SAM
+    export_pointcloud: bool = False       # Export point cloud from depth pass
+    pointcloud_format: str = "ply"        # "ply" or "glb"
 
-    # Edge refinement
-    edge_softness: float = 1.0
+    # Matte combine settings (core erosion, despill)
     core_shrink: int = 3
     despill_strength: float = 0.5
-
-    # Temporal smoothing
-    temporal_window: int = 5
-    keyframe_interval: int = 30
 
     # Output settings
     output_format: str = "exr"
@@ -182,8 +181,6 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
     presets = {
         'draft': {
             'depth_model': 'small',
-            'temporal_window': 3,
-            'edge_softness': 0.5,
             # DA3 settings: fast, basic detail
             'depth_process_res': None,  # auto (image size)
             'depth_process_method': 'upper',
@@ -198,8 +195,6 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
         },
         'standard': {
             'depth_model': 'base',
-            'temporal_window': 5,
-            'edge_softness': 1.0,
             # DA3 settings: balanced - explicit 1536 for reasonable quality/speed
             'depth_process_res': 1536,  # Explicit resolution (was None/auto)
             'depth_process_method': 'upper',
@@ -214,8 +209,6 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
         },
         'high': {
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
-            'temporal_window': 7,
-            'edge_softness': 1.5,
             # DA3 settings: optimized for fine detail - explicit 2048 for quality
             'depth_process_res': 2048,  # Explicit high resolution (was None/auto)
             'depth_process_method': 'lower',  # process_res is min dimension
@@ -230,8 +223,6 @@ def get_quality_preset(quality: str) -> Dict[str, Any]:
         },
         'ultra': {
             'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
-            'temporal_window': 9,
-            'edge_softness': 2.0,
             # DA3 settings: maximum detail capture
             'depth_process_res': 2048,  # Explicit high resolution
             'depth_process_method': 'lower',  # process_res is min dimension
@@ -420,9 +411,22 @@ def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
         alpha_dir.mkdir(exist_ok=True)
         preview_dir.mkdir(exist_ok=True)
 
+        # Determine detection mode
+        use_interactive_points = config.interactive_points
+        use_interactive = config.interactive
+        use_box = bool(config.box)
+        
         # Parse text prompts (support multiple via "." separator like SAM2 mode)
         text_prompts = config.prompt.split(".") if config.prompt else ["person"]
-        logger.info(f"Text prompts: {text_prompts}")
+        
+        if use_interactive_points:
+            logger.info("Mode: INTERACTIVE POINTS (LEFT=include, RIGHT=exclude)")
+        elif use_interactive:
+            logger.info("Mode: INTERACTIVE BOX")
+        elif use_box:
+            logger.info(f"Mode: BOX ({config.box})")
+        else:
+            logger.info(f"Text prompts: {text_prompts}")
 
         # Initialize SAM3 with inference settings
         sam3 = SAM3Segmenter(
@@ -448,7 +452,40 @@ def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
         # Check if input is video or frames directory
         input_path = Path(config.input_path)
 
-        if input_path.is_file():
+        # Handle interactive points mode
+        if use_interactive_points:
+            from auto_roto import interactive_point_selection
+            
+            # Get first frame for selection
+            if input_path.is_dir():
+                frames_list = sorted(input_path.glob("*.png")) + sorted(input_path.glob("*.jpg"))
+                if frames_list:
+                    first_frame = cv2.imread(str(frames_list[0]))
+                    first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+            else:
+                cap = cv2.VideoCapture(str(input_path))
+                ret, first_frame = cap.read()
+                cap.release()
+                if ret:
+                    first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+                else:
+                    raise ValueError("Could not read first frame")
+            
+            # Run interactive point selection
+            points, labels = interactive_point_selection(first_frame, logger)
+            logger.info(f"Selected {sum(labels)} include points, {len(labels) - sum(labels)} exclude points")
+            
+            # Process with points
+            if input_path.is_dir():
+                for idx, mask in sam3.segment_frames_with_points(str(input_path), points, labels):
+                    if mask is not None:
+                        writer.write_alpha(mask, idx)
+            else:
+                for idx, mask in sam3.segment_video_with_points(str(input_path), points, labels):
+                    if mask is not None:
+                        writer.write_alpha(mask, idx)
+
+        elif input_path.is_file():
             # Process video file with SAM3 video predictor
             logger.info(f"Processing video: {input_path}")
 
@@ -506,10 +543,6 @@ def run_pipeline(config: PipelineConfig):
     preset = get_quality_preset(config.quality)
     if not config.depth_model:
         config.depth_model = preset['depth_model']
-    if config.temporal_window == 5:  # Default
-        config.temporal_window = preset['temporal_window']
-    if config.edge_softness == 1.0:  # Default
-        config.edge_softness = preset['edge_softness']
     # Apply DA3 depth sensitivity settings from preset (unless overridden)
     if config.depth_process_res is None and 'depth_process_res' in preset:
         config.depth_process_res = preset['depth_process_res']
@@ -565,12 +598,19 @@ def run_pipeline(config: PipelineConfig):
     # Intermediate directories
     sam_output = output_dir / "01_sam_output"
     depth_output = output_dir / "02_depth_output"
-    refine_stage_dir = "03_mam2_output" if config.refiner == "mam2" else "03_vitmatte_output"
+    refine_stage_dir = "03_matanyone1_output" if config.refiner in ("mam2", "ma1") else "03_vitmatte_output"
     vitmatte_output = output_dir / refine_stage_dir
-    edge_output = output_dir / "04_edge_output"
-    temporal_output = output_dir / "05_temporal_output"
-    combine_output = output_dir / "06_combine_output"
+    combine_output = output_dir / "04_combine_output"
     final_output = output_dir / "final"
+    
+    # Clean output directories if requested
+    if config.clean_output:
+        logger.info("Cleaning output directories (--clean)...")
+        for d in [sam_output, depth_output, vitmatte_output,
+                  combine_output, final_output]:
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+                logger.info(f"  Removed: {d.name}")
 
     # Find scripts
     script_dir = Path(__file__).parent
@@ -588,7 +628,45 @@ def run_pipeline(config: PipelineConfig):
     logger.info(f"SAM3: imgsz={sam_imgsz_str}, conf={config.sam_conf}, retina={config.sam_retina_masks}")
     logger.info(f"Depth Model: {config.depth_model}")
     logger.info(f"Refiner: {config.refiner}")
+    if config.depth_first:
+        logger.info("Depth Mode: PURE (runs before SAM, no alpha)")
     logger.info("="*60)
+
+    # =========================================================================
+    # STAGE 0: Pure Depth Pass (optional, runs BEFORE SAM)
+    # =========================================================================
+    pure_depth_output = output_dir / "00_depth_pure"
+    if config.depth_first:
+        depth_pass_script = find_script("depth_pass.py")
+        
+        depth_pass_args = [
+            "--frames", frames_arg,
+            "--output", str(pure_depth_output),
+            "--model", config.depth_model or "large",
+            "--process-method", config.depth_process_method,
+            "--percentiles", str(config.depth_norm_percentiles[0]),
+            str(config.depth_norm_percentiles[1]),
+        ]
+        
+        if config.depth_process_res is not None:
+            depth_pass_args.extend(["--process-res", str(config.depth_process_res)])
+        
+        if config.export_pointcloud:
+            depth_pass_args.append("--export-pointcloud")
+            depth_pass_args.extend(["--pointcloud-format", config.pointcloud_format])
+        
+        if config.verbose:
+            depth_pass_args.append("--verbose")
+        
+        success = run_python_stage(
+            depth_pass_script, depth_pass_args,
+            "Pure Depth Pass", config.verbose
+        )
+        
+        if not success:
+            logger.warning("Pure depth pass failed, continuing without pre-computed depth")
+        
+        clear_gpu_memory()
 
     # =========================================================================
     # STAGE 1: SAM3 Segmentation (built-in text prompting)
@@ -628,6 +706,8 @@ def run_pipeline(config: PipelineConfig):
             "--depth-method", config.depth_process_method,
             "--depth-percentiles", str(config.depth_norm_percentiles[0]),
             str(config.depth_norm_percentiles[1]),
+            # Pure depth mode - no alpha influence on depth
+            "--depth-only",
         ]
 
         # Add optional depth_process_res if explicitly set
@@ -656,18 +736,22 @@ def run_pipeline(config: PipelineConfig):
         depth_output = sam_output
 
     # =========================================================================
-    # STAGE 3: Alpha Refinement (ViTMatte or MatAnyone2)
+    # STAGE 3: Alpha Refinement (ViTMatte or MatAnyone1)
     # =========================================================================
     if not config.skip_vitmatte:
-        # Determine sources
+        # Determine alpha source - depth stage now outputs ONLY depth (no alpha refinement)
+        # So always use SAM alpha as the source for ViTMatte refinement
         sam_alpha = sam_output / "alpha"
         if not sam_alpha.exists():
             sam_alpha = sam_output
 
-        if config.refiner == "mam2":
+        alpha_source = sam_alpha
+        logger.info(f"Using SAM alpha from: {alpha_source}")
+
+        if config.refiner in ("mam2", "ma1"):
             refine_script = find_script("mam2_refine.py")
             refine_args = [
-                "--sam-mask", str(sam_alpha),
+                "--sam-mask", str(alpha_source),
                 "--frames", frames_arg,
                 "--output", str(vitmatte_output),
                 "--checkpoint", config.mam2_checkpoint,
@@ -676,7 +760,7 @@ def run_pipeline(config: PipelineConfig):
                 "--bit-depth", str(config.bit_depth),
                 "--device", config.device,
             ]
-            stage_name = "MatAnyone2 Refinement"
+            stage_name = "MatAnyone1 Refinement"
         else:
             refine_script = find_script("vitmatte_refine.py")
 
@@ -685,7 +769,7 @@ def run_pipeline(config: PipelineConfig):
                 depth_maps = depth_output
 
             refine_args = [
-                "--sam-mask", str(sam_alpha),
+                "--sam-mask", str(alpha_source),
                 "--depth", str(depth_maps),
                 "--frames", frames_arg,
                 "--output", str(vitmatte_output),
@@ -729,92 +813,15 @@ def run_pipeline(config: PipelineConfig):
         vitmatte_output = depth_output
 
     # =========================================================================
-    # STAGE 4: Edge Refinement
-    # =========================================================================
-    if not config.skip_edge:
-        edge_script = find_script("edge_refine.py")
-
-        # Determine alpha source (now from refinement stage)
-        alpha_source = vitmatte_output / "alpha"
-        if not alpha_source.exists():
-            alpha_source = vitmatte_output
-
-        edge_args = [
-            "--alpha", str(alpha_source),
-            "--output", str(edge_output),
-            "--frames", frames_arg,
-            "--softness", str(config.edge_softness),
-            "--core-shrink", str(config.core_shrink),
-            "--despill", str(config.despill_strength),
-            "--format", config.output_format,
-            "--bit-depth", str(config.bit_depth),
-        ]
-
-        if config.verbose:
-            edge_args.append("--verbose")
-
-        success = run_python_stage(
-            edge_script, edge_args,
-            "Edge Refinement", config.verbose
-        )
-
-        if not success:
-            logger.warning("Edge refinement failed, continuing with previous output")
-            edge_output = vitmatte_output
-
-        clear_gpu_memory()  # Clean up after Edge Refinement
-    else:
-        logger.info("Skipping Edge Refinement (--skip-edge)")
-        edge_output = vitmatte_output
-
-    # =========================================================================
-    # STAGE 5: Temporal Smoothing
-    # =========================================================================
-    if not config.skip_temporal:
-        temporal_script = find_script("temporal_smooth.py")
-
-        # Determine alpha source
-        alpha_source = edge_output / "alpha"
-        if not alpha_source.exists():
-            alpha_source = edge_output
-
-        temporal_args = [
-            "--alpha", str(alpha_source),
-            "--output", str(temporal_output),
-            "--frames", frames_arg,
-            "--window", str(config.temporal_window),
-            "--keyframe-interval", str(config.keyframe_interval),
-            "--format", config.output_format,
-            "--bit-depth", str(config.bit_depth),
-        ]
-
-        if config.verbose:
-            temporal_args.append("--verbose")
-
-        success = run_python_stage(
-            temporal_script, temporal_args,
-            "Temporal Smoothing", config.verbose
-        )
-
-        if not success:
-            logger.warning("Temporal smoothing failed, continuing with previous output")
-            temporal_output = edge_output
-
-        clear_gpu_memory()  # Clean up after Temporal Smoothing
-    else:
-        logger.info("Skipping Temporal Smoothing (--skip-temporal)")
-        temporal_output = edge_output
-
-    # =========================================================================
-    # STAGE 6: Matte Combination
+    # STAGE 4: Matte Combination
     # =========================================================================
     if not config.skip_combine:
         combine_script = find_script("matte_combine.py")
 
         # Determine alpha source
-        alpha_source = temporal_output / "alpha"
+        alpha_source = vitmatte_output / "alpha"
         if not alpha_source.exists():
-            alpha_source = temporal_output
+            alpha_source = vitmatte_output
 
         combine_args = [
             "--alpha", str(alpha_source),
@@ -836,15 +843,15 @@ def run_pipeline(config: PipelineConfig):
 
         if not success:
             logger.warning("Matte combination failed, using previous output")
-            combine_output = temporal_output
+            combine_output = vitmatte_output
 
         clear_gpu_memory()  # Clean up after Matte Combination
     else:
         logger.info("Skipping Matte Combination (--skip-combine)")
-        combine_output = temporal_output
+        combine_output = vitmatte_output
 
     # =========================================================================
-    # STAGE 7: Hair Refinement (Using Adaptive ViTMatte)
+    # STAGE 5: Hair Refinement (Using Adaptive ViTMatte)
     # =========================================================================
     if not config.skip_hair:
         # POINT TO THE NEW SCRIPT
@@ -940,8 +947,8 @@ def run_pipeline(config: PipelineConfig):
     # Cleanup intermediate if not keeping
     if not config.keep_intermediate:
         logger.info("Cleaning up intermediate files...")
-        for intermediate in [sam_output, depth_output, vitmatte_output, edge_output,
-                           temporal_output, combine_output]:
+        for intermediate in [sam_output, depth_output, vitmatte_output,
+                           combine_output]:
             if intermediate.exists() and intermediate != final_output:
                 shutil.rmtree(intermediate, ignore_errors=True)
         if frames_is_temp and frames_dir and frames_dir.exists():
@@ -982,10 +989,10 @@ EXAMPLES:
   %(prog)s --input video.mp4 --prompt "person" --output ./output
 
   # Process PNG sequence with high quality
-  %(prog)s --input /path/to/frames/ --prompt "car" --output ./output --quality high
+  %(prog)s --input /path/to/frames/ --prompt "person" --output ./output --quality high
 
   # Quick mode (SAM3 + edge only)
-  %(prog)s --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
+  %(prog)s --input video.mp4 --prompt "person" --output ./output --quality draft
 
   # Interactive selection
   %(prog)s --input video.mp4 --interactive --output ./output
@@ -994,7 +1001,7 @@ QUALITY PRESETS:
   draft    - Fastest, small depth model
   standard - Balanced quality and speed (default)
   high     - Best quality, large depth model
-  ultra    - Maximum quality, longer temporal window
+  ultra    - Maximum quality, large depth model
 
 NOTE: SAM3 includes built-in text prompting (270k+ concepts).
       No separate GroundingDINO required.
@@ -1014,7 +1021,9 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     prompt_group.add_argument("--box", "-b",
                              help="Box prompt: x1,y1,x2,y2")
     prompt_group.add_argument("--interactive", action="store_true",
-                             help="Interactive selection")
+                             help="Interactive box selection")
+    prompt_group.add_argument("--interactive-points", action="store_true",
+                             help="Interactive point marking (LEFT=include, RIGHT=exclude)")
 
     # Quality
     parser.add_argument("--quality", "-q",
@@ -1025,32 +1034,30 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     # Stage control
     parser.add_argument("--skip-sam", action="store_true",
                        help="Skip SAM3 (use existing alpha)")
+    parser.add_argument("--clean", action="store_true",
+                       help="Clear all output directories before running (removes stale files)")
     parser.add_argument("--skip-depth", action="store_true",
                        help="Skip depth refinement")
     parser.add_argument("--skip-vitmatte", action="store_true",
-                       help="Skip alpha refinement stage (ViTMatte/MatAnyone2)")
-    parser.add_argument("--skip-edge", action="store_true",
-                       help="Skip edge refinement")
-    parser.add_argument("--skip-temporal", action="store_true",
-                       help="Skip temporal smoothing")
+                       help="Skip alpha refinement stage (ViTMatte/MatAnyone1)")
     parser.add_argument("--skip-combine", action="store_true",
                        help="Skip matte combination")
     parser.add_argument("--with-hair", action="store_true",
-                       help="Enable hair refinement (off by default)")
+                       help="Enable hair refinement stage")
 
     # Alpha refinement selection
-    parser.add_argument("--refiner", choices=["vitmatte", "mam2"], default="vitmatte",
-                       help="Alpha refinement model (default: vitmatte)")
-    parser.add_argument("--mam2-checkpoint", default="./checkpoints/mam2.pth",
-                       help="MatAnyone2 checkpoint path")
-    parser.add_argument("--mam2-repo", default="MatAnyone2",
-                       help="MatAnyone2 repo path (relative or absolute)")
+    parser.add_argument("--refiner", choices=["vitmatte", "mam2", "ma1"], default="vitmatte",
+                       help="Alpha refinement model (default: vitmatte, MatAnyone1=ma1)")
+    parser.add_argument("--mam2-checkpoint", default="./checkpoints/matanyone.pth",
+                       help="MatAnyone checkpoint path")
+    parser.add_argument("--mam2-repo", default="./MatAnyone",
+                       help="MatAnyone repo path (relative or absolute)")
 
     # SAM3 settings
     parser.add_argument("--sam-imgsz", type=int, default=0,
                        help="SAM3 processing resolution (default: 0 = auto from input, max 2048)")
     parser.add_argument("--sam-conf", type=float, default=0.25,
-                       help="SAM3 confidence threshold (default: 0.25, lower = more inclusive masks)")
+                       help="SAM3 confidence threshold")
     parser.add_argument("--no-retina-masks", action="store_true",
                        help="Disable high-resolution mask output")
     parser.add_argument("--sam-max-det", type=int, default=100,
@@ -1073,6 +1080,15 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
                        help="Depth normalization percentiles. Wider (1 99) preserves more detail")
     parser.add_argument("--use-depth-confidence", action="store_true",
                        help="Use DA3 confidence maps for semi-transparent edges")
+    
+    # Pure depth pass (before SAM)
+    parser.add_argument("--depth-first", action="store_true",
+                       help="Run pure depth pass BEFORE SAM (no alpha input)")
+    parser.add_argument("--export-pointcloud", action="store_true",
+                       help="Export point cloud from depth pass")
+    parser.add_argument("--pointcloud-format", default="ply",
+                       choices=["ply", "glb"],
+                       help="Point cloud format (default: ply)")
 
     # ViTMatte settings (adaptive trimap)
     parser.add_argument("--vitmatte-motion", action="store_true",
@@ -1098,19 +1114,11 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     parser.add_argument("--guided-eps", type=float, default=None,
                        help="Guided filter epsilon (lower=stricter edges, default: from quality preset)")
 
-    # Edge settings
-    parser.add_argument("--edge-softness", type=float, default=1.0,
-                       help="Edge softness (default: 1.0)")
+    # Matte combine settings
     parser.add_argument("--core-shrink", type=int, default=3,
-                       help="Core shrink pixels (default: 3)")
+                       help="Core shrink pixels for matte combine (default: 3)")
     parser.add_argument("--despill", type=float, default=0.5,
-                       help="Despill strength (default: 0.5)")
-
-    # Temporal settings
-    parser.add_argument("--temporal-window", type=int, default=5,
-                       help="Temporal window size (default: 5)")
-    parser.add_argument("--keyframe-interval", type=int, default=30,
-                       help="Keyframe interval (default: 30)")
+                       help="Despill strength for matte combine (default: 0.5)")
 
     # Output format
     parser.add_argument("--format", default="exr",
@@ -1144,12 +1152,12 @@ def main():
         prompt=args.prompt or "",
         box=args.box or "",
         interactive=args.interactive,
+        interactive_points=args.interactive_points,
         quality=args.quality,
         skip_sam=args.skip_sam,
+        clean_output=args.clean,
         skip_depth=args.skip_depth,
         skip_vitmatte=args.skip_vitmatte,
-        skip_edge=args.skip_edge,
-        skip_temporal=args.skip_temporal,
         skip_combine=args.skip_combine,
         skip_hair=not args.with_hair,
         refiner=args.refiner,
@@ -1161,6 +1169,9 @@ def main():
         depth_process_method=args.depth_method,
         depth_norm_percentiles=tuple(args.depth_percentiles),
         use_depth_confidence=args.use_depth_confidence,
+        depth_first=args.depth_first,
+        export_pointcloud=args.export_pointcloud,
+        pointcloud_format=args.pointcloud_format,
         # SAM3 settings
         sam_imgsz=args.sam_imgsz,
         sam_conf=args.sam_conf,
@@ -1178,11 +1189,8 @@ def main():
         # Guided Filter settings (None = use quality preset)
         guided_filter_radius=args.guided_radius,
         guided_filter_eps=args.guided_eps,
-        edge_softness=args.edge_softness,
         core_shrink=args.core_shrink,
         despill_strength=args.despill,
-        temporal_window=args.temporal_window,
-        keyframe_interval=args.keyframe_interval,
         output_format=args.format,
         bit_depth=args.bit_depth,
         device=args.device,

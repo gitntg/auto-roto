@@ -163,7 +163,7 @@ class RotoConfig:
 
     # SAM3 inference settings
     sam_imgsz: int = 0              # Processing resolution (0 = auto from input, max 8192)
-    sam_conf: float = 0.25          # Confidence threshold (0.0-1.0, lower = more detections)
+    sam_conf: float = 0.15          # Confidence threshold (0.0-1.0, lower = more detections/details)
     sam_retina_masks: bool = True   # High-resolution mask output
     sam_max_det: int = 100          # Maximum detections per frame
 
@@ -213,6 +213,96 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     
     logger = logging.getLogger("AutoRoto")
     return logger
+
+
+# ==============================================================================
+# INTERACTIVE POINT SELECTION
+# ==============================================================================
+
+def interactive_point_selection(frame: 'np.ndarray', logger=None) -> tuple:
+    """
+    Interactive point selection for include/exclude marking.
+    
+    LEFT CLICK = Include (foreground, label=1)
+    RIGHT CLICK = Exclude (background, label=0)
+    Press ENTER or ESC when done.
+    
+    Args:
+        frame: RGB image (numpy array)
+        logger: Optional logger
+        
+    Returns:
+        (points, labels) tuple where:
+            points: List of (x, y) coordinates
+            labels: List of labels (1=include, 0=exclude)
+    """
+    import cv2
+    import numpy as np
+    
+    points = []
+    labels = []
+    
+    # Create display copy
+    display = frame.copy()
+    window_name = "Mark Points: LEFT=Include GREEN | RIGHT=Exclude RED | ENTER=Done"
+    
+    def draw_points(img):
+        """Redraw all points on image."""
+        display = img.copy()
+        for (x, y), label in zip(points, labels):
+            color = (0, 255, 0) if label == 1 else (255, 0, 0)  # Green=include, Red=exclude
+            cv2.circle(display, (x, y), 8, color, -1)
+            cv2.circle(display, (x, y), 10, (255, 255, 255), 2)
+            text = "+" if label == 1 else "-"
+            cv2.putText(display, text, (x + 12, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return display
+    
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal display
+        
+        if event == cv2.EVENT_LBUTTONDOWN:
+            # Left click = Include (foreground)
+            points.append((x, y))
+            labels.append(1)
+            if logger:
+                logger.info(f"  + INCLUDE point at ({x}, {y})")
+            display = draw_points(frame)
+            cv2.imshow(window_name, display[:, :, ::-1])
+            
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # Right click = Exclude (background)
+            points.append((x, y))
+            labels.append(0)
+            if logger:
+                logger.info(f"  - EXCLUDE point at ({x}, {y})")
+            display = draw_points(frame)
+            cv2.imshow(window_name, display[:, :, ::-1])
+    
+    # Setup window
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, min(frame.shape[1], 1280), min(frame.shape[0], 720))
+    cv2.setMouseCallback(window_name, mouse_callback)
+    cv2.imshow(window_name, frame[:, :, ::-1])
+    
+    if logger:
+        logger.info("Interactive Point Selection:")
+        logger.info("  LEFT CLICK  = Mark as INCLUDE (green)")
+        logger.info("  RIGHT CLICK = Mark as EXCLUDE (red)")
+        logger.info("  ENTER/ESC   = Finish selection")
+    
+    while True:
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27 or key == 13:  # ESC or ENTER
+            break
+    
+    cv2.destroyAllWindows()
+    
+    if logger:
+        include_count = sum(labels)
+        exclude_count = len(labels) - include_count
+        logger.info(f"Selected: {include_count} include, {exclude_count} exclude points")
+    
+    return points, labels
 
 
 # ==============================================================================
@@ -1607,6 +1697,102 @@ class AutoRotoPipeline:
         cv2.destroyAllWindows()
         
         return boxes
+    
+    def segment_frames_with_points(
+        self,
+        frames_dir: str,
+        points: List[Tuple[int, int]],
+        labels: List[int]
+    ):
+        """
+        Segment frames using point prompts with include/exclude labels.
+        
+        Args:
+            frames_dir: Directory with frames
+            points: List of (x, y) coordinates
+            labels: List of labels (1 = include/foreground, 0 = exclude/background)
+            
+        Yields:
+            (frame_idx, mask) tuples
+        """
+        import numpy as np
+        from pathlib import Path
+        
+        frames_path = Path(frames_dir)
+        frame_files = sorted(
+            list(frames_path.glob("*.png")) + 
+            list(frames_path.glob("*.jpg")) + 
+            list(frames_path.glob("*.jpeg"))
+        )
+        
+        self.logger.info(f"Processing {len(frame_files)} frames with {len(points)} points")
+        
+        for idx, frame_file in enumerate(frame_files):
+            frame = cv2.imread(str(frame_file))
+            if frame is None:
+                continue
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            masks = self.segment_image_with_points(frame, points, labels)
+            
+            if masks:
+                combined = np.zeros(frame.shape[:2], dtype=np.float32)
+                for m in masks:
+                    combined = np.maximum(combined, m.astype(np.float32))
+                yield idx, combined
+            else:
+                yield idx, None
+                
+            if idx % 10 == 0:
+                self.logger.info(f"  Frame {idx}/{len(frame_files)}")
+    
+    def segment_video_with_points(
+        self,
+        video_path: str,
+        points: List[Tuple[int, int]],
+        labels: List[int]
+    ):
+        """
+        Segment video using point prompts with include/exclude labels.
+        
+        Args:
+            video_path: Path to video file
+            points: List of (x, y) coordinates
+            labels: List of labels (1 = include/foreground, 0 = exclude/background)
+            
+        Yields:
+            (frame_idx, mask) tuples
+        """
+        import numpy as np
+        import cv2
+        
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        self.logger.info(f"Processing video with {len(points)} points ({total_frames} frames)")
+        
+        idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            masks = self.segment_image_with_points(frame_rgb, points, labels)
+            
+            if masks:
+                combined = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                for m in masks:
+                    combined = np.maximum(combined, m.astype(np.float32))
+                yield idx, combined
+            else:
+                yield idx, None
+                
+            if idx % 10 == 0:
+                self.logger.info(f"  Frame {idx}/{total_frames}")
+            idx += 1
+        
+        cap.release()
 
     def release(self) -> None:
         """Release all resources and free GPU memory."""
