@@ -8,15 +8,17 @@ Usage:
     python -m auto_roto <command> [options]
 
 Commands:
-    sam      - SAM3 segmentation
-    depth    - Depth estimation
-    pipeline - Full pipeline (SAM + Depth + ViTMatte + Combine)
-    version  - Show version
+    sam         - SAM3 segmentation
+    depth       - Depth estimation
+    pipeline    - Full pipeline (SAM + Depth + ViTMatte + Combine)
+    interactive - Interactive SAM3 → MatAnyone workflow
+    version     - Show version
 
 Examples:
     python -m auto_roto sam --input video.mp4 --prompt "person"
     python -m auto_roto depth --input ./frames --output ./output
     python -m auto_roto pipeline --input video.mp4 --prompt "person" --quality high
+    python -m auto_roto interactive --input video.mp4 --prompt "person"
 """
 
 import sys
@@ -31,14 +33,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  sam        SAM3 segmentation
-  depth      Depth estimation
-  pipeline   Full pipeline (default)
-  version    Show version
+  sam          SAM3 segmentation
+  depth        Depth estimation
+  pipeline     Full pipeline (SAM + Depth + ViTMatte + Combine)
+  interactive  Interactive SAM3 → MatAnyone (recommended for video)
+  version      Show version
 
 Examples:
   python -m auto_roto sam --input video.mp4 --prompt "person"
   python -m auto_roto pipeline --input video.mp4 --prompt "person" --quality high
+  python -m auto_roto interactive --input video.mp4 --prompt "person"
 
 For command-specific help:
   python -m auto_roto <command> --help
@@ -48,7 +52,7 @@ For command-specific help:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["sam", "depth", "pipeline", "version"],
+        choices=["sam", "depth", "pipeline", "interactive", "version"],
         help="Command to run"
     )
 
@@ -81,6 +85,12 @@ For command-specific help:
         sys.argv = [sys.argv[0]] + remaining
         from auto_roto.cli.pipeline import main as pipeline_main
         pipeline_main()
+
+    elif args.command == "interactive":
+        # Pass remaining args to interactive CLI
+        sys.argv = [sys.argv[0]] + remaining
+        from auto_roto.cli.interactive import main as interactive_main
+        interactive_main()
 
 
 if __name__ == "__main__":
