@@ -291,10 +291,11 @@ class SAM3Segmenter:
         labels: List[int]
     ) -> List[np.ndarray]:
         """
-        Segment image using BOTH text prompts AND point prompts together.
+        Segment image using text prompts with bounding box hints from points.
 
-        This allows refinement of text-based segmentation with include/exclude points.
-        Points with label=1 indicate foreground (include), label=0 indicate background (exclude).
+        SAM3SemanticPredictor supports text + bboxes together (priority: bboxes > text).
+        This converts include points to small bounding boxes to guide segmentation.
+        Exclude points are applied as post-processing mask subtraction.
 
         Args:
             image: RGB image (numpy array)
@@ -305,24 +306,46 @@ class SAM3Segmenter:
         Returns:
             List of binary masks refined by both text and point prompts
         """
+        import cv2
+
         self.logger.info(f"Segmenting with text prompts: {text_prompts}")
-        self.logger.info(f"  + {len(points)} refinement points ({sum(labels)} include, {len(labels) - sum(labels)} exclude)")
+        n_include = sum(labels)
+        n_exclude = len(labels) - n_include
+        self.logger.info(f"  + {len(points)} refinement points ({n_include} include, {n_exclude} exclude)")
 
         if self._resolved_imgsz is None:
             self._resolved_imgsz = self._resolve_imgsz(image.shape)
 
+        h, w = image.shape[:2]
+
+        # Separate include and exclude points
+        include_points = [(x, y) for (x, y), lbl in zip(points, labels) if lbl == 1]
+        exclude_points = [(x, y) for (x, y), lbl in zip(points, labels) if lbl == 0]
+
+        # Convert include points to bounding boxes
+        # SAM3SemanticPredictor supports text + bboxes together
+        bboxes = None
+        if include_points:
+            box_size = max(30, min(h, w) // 20)  # Adaptive box size
+            bboxes = []
+            for x, y in include_points:
+                x1 = max(0, x - box_size)
+                y1 = max(0, y - box_size)
+                x2 = min(w, x + box_size)
+                y2 = min(h, y + box_size)
+                bboxes.append([x1, y1, x2, y2])
+            bboxes = np.array(bboxes, dtype=np.float32)
+            self.logger.info(f"  Created {len(bboxes)} bounding boxes from include points")
+
+        # Run SAM3 with text + bboxes
         self.image_predictor.set_image(image)
 
-        # Convert points and labels to numpy arrays
-        points_np = np.array(points, dtype=np.float32) if points else None
-        labels_np = np.array(labels, dtype=np.int32) if labels else None
-
-        # Call predictor with both text and points
-        results = self.image_predictor(
-            text=text_prompts,
-            points=points_np,
-            labels=labels_np
-        )
+        if bboxes is not None:
+            # Use text + bboxes together
+            results = self.image_predictor(text=text_prompts, bboxes=bboxes)
+        else:
+            # Text only
+            results = self.image_predictor(text=text_prompts)
 
         masks = []
         for result in results:
@@ -330,8 +353,36 @@ class SAM3Segmenter:
                 for mask in result.masks.data:
                     masks.append(mask.cpu().numpy())
 
-        self.logger.info(f"Found {len(masks)} masks from combined text+point prompts")
-        return masks
+        if not masks:
+            self.logger.warning("No masks returned from SAM3")
+            return []
+
+        # Combine all masks
+        combined_mask = np.zeros((h, w), dtype=np.float32)
+        for m in masks:
+            if m.shape != (h, w):
+                m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+            combined_mask = np.maximum(combined_mask, m.astype(np.float32))
+
+        # Apply exclude points as mask subtraction
+        if exclude_points:
+            self.logger.info(f"  Applying {len(exclude_points)} exclude points")
+            exclude_radius = max(25, min(h, w) // 15)  # Larger radius for exclusion
+
+            for x, y in exclude_points:
+                # Create circular exclusion region
+                y_coords, x_coords = np.ogrid[:h, :w]
+                dist_from_point = np.sqrt((x_coords - x) ** 2 + (y_coords - y) ** 2)
+
+                # Soft falloff for smoother edges
+                exclusion = np.clip(1 - dist_from_point / exclude_radius, 0, 1)
+                combined_mask = combined_mask * (1 - exclusion * 0.95)
+
+        # Threshold to binary
+        combined_mask = (combined_mask > 0.5).astype(np.float32)
+
+        self.logger.info(f"Refined mask with {n_include} include boxes and {n_exclude} exclude regions")
+        return [combined_mask]
 
     def segment_video_with_box(
         self,
