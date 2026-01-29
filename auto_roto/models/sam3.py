@@ -358,9 +358,9 @@ class SAM3Segmenter:
         points_np = np.array(points, dtype=np.float32)
         labels_np = np.array(labels, dtype=np.int32)
 
-        # Create base predictor for refinement if needed
+        # Create SAM3 predictor for refinement if needed
         if not hasattr(self, '_refine_predictor') or self._refine_predictor is None:
-            from ultralytics.models.sam import Predictor as SAMPredictor
+            from ultralytics.models.sam import SAM3Predictor
             overrides = dict(
                 conf=self.conf,
                 imgsz=self.imgsz,
@@ -372,8 +372,8 @@ class SAM3Segmenter:
                 half=self.half_precision,
                 device=self.device,
             )
-            self._refine_predictor = SAMPredictor(overrides=overrides)
-            self.logger.info("  Created base SAM predictor for refinement")
+            self._refine_predictor = SAM3Predictor(overrides=overrides)
+            self.logger.info("  Created SAM3Predictor for point refinement")
 
         # Set image on refine predictor
         self._refine_predictor.set_image(image)
