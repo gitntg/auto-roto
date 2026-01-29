@@ -354,12 +354,41 @@ class InteractiveMatAnyonePipeline:
                     else:
                         self._logger.warning("  No masks found at lower confidence")
 
+                elif choice == "fill_holes":
+                    # Fill interior holes in the mask
+                    current_mask = self._fill_mask_holes(current_mask)
+                    self._logger.info("  Filled interior holes in mask")
+
                 elif choice == "quit":
                     self._logger.info("  User cancelled")
                     return None
 
         finally:
             sam3.release()
+
+    def _fill_mask_holes(self, mask: np.ndarray) -> np.ndarray:
+        """
+        Fill interior holes in the mask.
+
+        Uses morphological operations to:
+        1. Fill holes completely enclosed by the mask
+        2. Close small gaps with morphological closing
+        """
+        import cv2
+        from scipy import ndimage
+
+        # Convert to binary
+        binary_mask = (mask > 0.5).astype(np.uint8)
+
+        # Fill holes using scipy (fills regions completely surrounded by foreground)
+        filled = ndimage.binary_fill_holes(binary_mask).astype(np.uint8)
+
+        # Optional: morphological closing to smooth edges and fill small gaps
+        kernel_size = max(5, min(mask.shape) // 100)  # Adaptive kernel
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel)
+
+        return filled.astype(np.float32)
 
     def _create_preview(
         self,
@@ -402,6 +431,7 @@ class InteractiveMatAnyonePipeline:
         print("REVIEW FIRST-FRAME MASK")
         print("=" * 50)
         print("  [A] Accept - proceed to MatAnyone")
+        print("  [F] Fill holes - fill interior gaps in mask")
         print("  [P] Add prompt - add text prompts (e.g. 'hair', 'arm')")
         print("  [S] More sensitive - lower confidence threshold")
         print("  [Q] Quit - cancel pipeline (or Ctrl+C)")
@@ -409,10 +439,12 @@ class InteractiveMatAnyonePipeline:
 
         while True:
             try:
-                choice = input("Your choice (A/P/S/Q): ").strip().upper()
+                choice = input("Your choice (A/F/P/S/Q): ").strip().upper()
 
                 if choice in ("A", "ACCEPT"):
                     return "accept"
+                elif choice in ("F", "FILL"):
+                    return "fill_holes"
                 elif choice in ("P", "PROMPT", "ADD"):
                     return "add_prompt"
                 elif choice in ("S", "SENSITIVE", "MORE"):
@@ -420,7 +452,7 @@ class InteractiveMatAnyonePipeline:
                 elif choice in ("Q", "QUIT", "EXIT", ""):
                     return "quit"
                 else:
-                    print("Invalid choice. Please enter A, P, S, or Q.")
+                    print("Invalid choice. Please enter A, F, P, S, or Q.")
 
             except (KeyboardInterrupt, EOFError):
                 print("\n")
