@@ -283,6 +283,56 @@ class SAM3Segmenter:
         self.logger.info(f"Found {len(masks)} masks from point prompts")
         return masks
 
+    def segment_image_with_text_and_points(
+        self,
+        image: np.ndarray,
+        text_prompts: List[str],
+        points: List[Tuple[int, int]],
+        labels: List[int]
+    ) -> List[np.ndarray]:
+        """
+        Segment image using BOTH text prompts AND point prompts together.
+
+        This allows refinement of text-based segmentation with include/exclude points.
+        Points with label=1 indicate foreground (include), label=0 indicate background (exclude).
+
+        Args:
+            image: RGB image (numpy array)
+            text_prompts: List of text descriptions (e.g., ["person", "dog"])
+            points: List of (x, y) coordinates for refinement
+            labels: List of labels (1 = foreground/include, 0 = background/exclude)
+
+        Returns:
+            List of binary masks refined by both text and point prompts
+        """
+        self.logger.info(f"Segmenting with text prompts: {text_prompts}")
+        self.logger.info(f"  + {len(points)} refinement points ({sum(labels)} include, {len(labels) - sum(labels)} exclude)")
+
+        if self._resolved_imgsz is None:
+            self._resolved_imgsz = self._resolve_imgsz(image.shape)
+
+        self.image_predictor.set_image(image)
+
+        # Convert points and labels to numpy arrays
+        points_np = np.array(points, dtype=np.float32) if points else None
+        labels_np = np.array(labels, dtype=np.int32) if labels else None
+
+        # Call predictor with both text and points
+        results = self.image_predictor(
+            text=text_prompts,
+            points=points_np,
+            labels=labels_np
+        )
+
+        masks = []
+        for result in results:
+            if result.masks is not None:
+                for mask in result.masks.data:
+                    masks.append(mask.cpu().numpy())
+
+        self.logger.info(f"Found {len(masks)} masks from combined text+point prompts")
+        return masks
+
     def segment_video_with_box(
         self,
         video_path: str,

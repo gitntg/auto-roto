@@ -285,25 +285,26 @@ class InteractiveMatAnyonePipeline:
                             f"{len(exclude_points)} exclude"
                         )
 
-                        # Re-run SAM3 with prompt + points
+                        # Re-run SAM3 with BOTH text prompts AND points together
+                        # This allows proper include/exclude refinement
                         all_points = include_points + exclude_points
                         all_labels = [1] * len(include_points) + [0] * len(exclude_points)
 
                         if all_points:
-                            # Segment with points
-                            point_masks = sam3.segment_image_with_points(
-                                first_frame, all_points, all_labels
+                            # Segment with combined text + point prompts
+                            refined_masks = sam3.segment_image_with_text_and_points(
+                                first_frame, prompts, all_points, all_labels
                             )
 
-                            if point_masks:
-                                # Combine with text-based mask
+                            if refined_masks:
+                                # Use the refined masks (text + points combined)
                                 current_mask = np.zeros(first_frame.shape[:2], dtype=np.float32)
-                                for m in masks:  # Original text masks
-                                    current_mask = np.maximum(current_mask, m.astype(np.float32))
-                                for m in point_masks:  # Point-refined masks
+                                for m in refined_masks:
                                     current_mask = np.maximum(current_mask, m.astype(np.float32))
 
-                                self._logger.info("  Mask updated with point refinements")
+                                self._logger.info("  Mask updated with text + point refinements")
+                            else:
+                                self._logger.warning("  No masks returned from refinement, keeping current")
                     else:
                         self._logger.info("  No points added")
 
