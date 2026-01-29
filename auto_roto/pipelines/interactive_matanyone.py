@@ -11,6 +11,7 @@ MatAnyone uses Consistent Memory Propagation - only needs first-frame mask.
 """
 
 import logging
+import signal
 import time
 import tempfile
 import subprocess
@@ -21,6 +22,11 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 logger = logging.getLogger("AutoRoto.Pipelines.InteractiveMatAnyone")
+
+
+class UserCancelledError(Exception):
+    """Raised when user cancels the pipeline (ESC, Ctrl+C, Q)."""
+    pass
 
 
 class InteractiveMatAnyonePipeline:
@@ -99,77 +105,108 @@ class InteractiveMatAnyonePipeline:
         """
         import cv2
 
+        # Setup signal handler for clean Ctrl+C exit
+        self._cancelled = False
+        original_sigint = signal.getsignal(signal.SIGINT)
+
+        def sigint_handler(signum, frame):
+            self._cancelled = True
+            print("\n\nCancelled by user (Ctrl+C)")
+            raise UserCancelledError("Interrupted by Ctrl+C")
+
+        signal.signal(signal.SIGINT, sigint_handler)
+
         start_time = time.time()
         input_path = Path(input_path)
         output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
 
-        self._logger.info("=" * 60)
-        self._logger.info("INTERACTIVE SAM3 → MATANYONE PIPELINE")
-        self._logger.info("=" * 60)
-        self._logger.info(f"Input: {input_path}")
-        self._logger.info(f"Output: {output_dir}")
-        self._logger.info(f"Prompt: {self.prompt}")
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
 
-        # =====================================================================
-        # STEP 1: Extract first frame
-        # =====================================================================
-        self._logger.info("\n[Step 1] Extracting first frame...")
+            self._logger.info("=" * 60)
+            self._logger.info("INTERACTIVE SAM3 → MATANYONE PIPELINE")
+            self._logger.info("=" * 60)
+            self._logger.info(f"Input: {input_path}")
+            self._logger.info(f"Output: {output_dir}")
+            self._logger.info(f"Prompt: {self.prompt}")
+            self._logger.info("(Press Ctrl+C or Q to cancel at any time)")
 
-        first_frame, fps, frame_count, frame_size = self._extract_first_frame(input_path)
-        if first_frame is None:
-            self._logger.error("Failed to extract first frame")
+            # =====================================================================
+            # STEP 1: Extract first frame
+            # =====================================================================
+            self._logger.info("\n[Step 1] Extracting first frame...")
+
+            first_frame, fps, frame_count, frame_size = self._extract_first_frame(input_path)
+            if first_frame is None:
+                self._logger.error("Failed to extract first frame")
+                return False
+
+            h, w = first_frame.shape[:2]
+            self._logger.info(f"  Video: {w}x{h}, {fps} fps, {frame_count} frames")
+
+            # Auto-adjust settings based on resolution
+            if auto_resolution_settings:
+                min_dim = min(h, w)
+                if min_dim <= 576:  # Low res
+                    self.warmup = 1
+                    self.erode_kernel = 4
+                    self.dilate_kernel = 4
+                    self._logger.info(f"  Low-res detected: warmup={self.warmup}, erode={self.erode_kernel}, dilate={self.dilate_kernel}")
+                else:  # High res
+                    self.warmup = 10
+                    self.erode_kernel = 15
+                    self.dilate_kernel = 15
+                    self._logger.info(f"  High-res detected: warmup={self.warmup}, erode={self.erode_kernel}, dilate={self.dilate_kernel}")
+
+            # =====================================================================
+            # STEP 2: Interactive SAM3 refinement loop
+            # =====================================================================
+            self._logger.info("\n[Step 2] Interactive first-frame segmentation...")
+
+            approved_mask = self._interactive_sam3_loop(first_frame, output_path)
+            if approved_mask is None:
+                self._logger.info("Pipeline cancelled by user")
+                return False
+
+            # Save approved mask
+            mask_path = output_path / "first_frame_mask.png"
+            cv2.imwrite(str(mask_path), (approved_mask * 255).astype(np.uint8))
+            self._logger.info(f"  Approved mask saved: {mask_path}")
+
+            # =====================================================================
+            # STEP 3: Run MatAnyone
+            # =====================================================================
+            self._logger.info("\n[Step 3] Running MatAnyone...")
+
+            success = self._run_matanyone(input_path, mask_path, output_path)
+
+            # Summary
+            total_time = time.time() - start_time
+
+            self._logger.info("\n" + "=" * 60)
+            self._logger.info("PIPELINE COMPLETE" if success else "PIPELINE FAILED")
+            self._logger.info("=" * 60)
+            self._logger.info(f"Total time: {total_time:.1f}s")
+            self._logger.info(f"Output: {output_path}")
+
+            return success
+
+        except (UserCancelledError, KeyboardInterrupt):
+            print("\n")
+            self._logger.info("=" * 60)
+            self._logger.info("PIPELINE CANCELLED BY USER")
+            self._logger.info("=" * 60)
             return False
 
-        h, w = first_frame.shape[:2]
-        self._logger.info(f"  Video: {w}x{h}, {fps} fps, {frame_count} frames")
-
-        # Auto-adjust settings based on resolution
-        if auto_resolution_settings:
-            min_dim = min(h, w)
-            if min_dim <= 576:  # Low res
-                self.warmup = 1
-                self.erode_kernel = 4
-                self.dilate_kernel = 4
-                self._logger.info(f"  Low-res detected: warmup={self.warmup}, erode={self.erode_kernel}, dilate={self.dilate_kernel}")
-            else:  # High res
-                self.warmup = 10
-                self.erode_kernel = 15
-                self.dilate_kernel = 15
-                self._logger.info(f"  High-res detected: warmup={self.warmup}, erode={self.erode_kernel}, dilate={self.dilate_kernel}")
-
-        # =====================================================================
-        # STEP 2: Interactive SAM3 refinement loop
-        # =====================================================================
-        self._logger.info("\n[Step 2] Interactive first-frame segmentation...")
-
-        approved_mask = self._interactive_sam3_loop(first_frame, output_path)
-        if approved_mask is None:
-            self._logger.error("User cancelled or segmentation failed")
-            return False
-
-        # Save approved mask
-        mask_path = output_path / "first_frame_mask.png"
-        cv2.imwrite(str(mask_path), (approved_mask * 255).astype(np.uint8))
-        self._logger.info(f"  Approved mask saved: {mask_path}")
-
-        # =====================================================================
-        # STEP 3: Run MatAnyone
-        # =====================================================================
-        self._logger.info("\n[Step 3] Running MatAnyone...")
-
-        success = self._run_matanyone(input_path, mask_path, output_path)
-
-        # Summary
-        total_time = time.time() - start_time
-
-        self._logger.info("\n" + "=" * 60)
-        self._logger.info("PIPELINE COMPLETE" if success else "PIPELINE FAILED")
-        self._logger.info("=" * 60)
-        self._logger.info(f"Total time: {total_time:.1f}s")
-        self._logger.info(f"Output: {output_path}")
-
-        return success
+        finally:
+            # Restore original signal handler
+            signal.signal(signal.SIGINT, original_sigint)
+            # Clean up any OpenCV windows
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     def _extract_first_frame(
         self,
@@ -357,20 +394,27 @@ class InteractiveMatAnyonePipeline:
         print("=" * 50)
         print("  [A] Accept - proceed to MatAnyone")
         print("  [P] Add points - refine with include/exclude points")
-        print("  [Q] Quit - cancel pipeline")
+        print("  [Q] Quit - cancel pipeline (or Ctrl+C / ESC)")
         print("=" * 50)
 
         while True:
-            choice = input("Your choice (A/P/Q): ").strip().upper()
+            try:
+                choice = input("Your choice (A/P/Q): ").strip().upper()
 
-            if choice in ("A", "ACCEPT"):
-                return "accept"
-            elif choice in ("P", "POINTS", "ADD"):
-                return "add_points"
-            elif choice in ("Q", "QUIT", "EXIT"):
+                if choice in ("A", "ACCEPT"):
+                    return "accept"
+                elif choice in ("P", "POINTS", "ADD"):
+                    return "add_points"
+                elif choice in ("Q", "QUIT", "EXIT", ""):
+                    # Empty string can happen if user presses Ctrl+C during input
+                    return "quit"
+                else:
+                    print("Invalid choice. Please enter A, P, or Q.")
+
+            except (KeyboardInterrupt, EOFError):
+                # Handle Ctrl+C or Ctrl+D during input
+                print("\n")
                 return "quit"
-            else:
-                print("Invalid choice. Please enter A, P, or Q.")
 
     def _interactive_point_selection(
         self,
@@ -424,25 +468,42 @@ class InteractiveMatAnyonePipeline:
         print("\nPoint Selection:")
         print("  LEFT-CLICK  = Add include point (green)")
         print("  RIGHT-CLICK = Add exclude point (red)")
+        print("  R           = Reset all points")
         print("  ENTER/SPACE = Done selecting")
-        print("  ESC         = Cancel")
+        print("  ESC/Q       = Cancel")
 
-        while True:
-            key = cv2.waitKey(1) & 0xFF
+        try:
+            while True:
+                key = cv2.waitKey(100) & 0xFF  # 100ms timeout for responsiveness
 
-            if key in (13, 32):  # Enter or Space
-                break
-            elif key == 27:  # Escape
-                include_points.clear()
-                exclude_points.clear()
-                break
-            elif key == ord('r'):  # Reset
-                display = original_display.copy()
-                include_points.clear()
-                exclude_points.clear()
-                cv2.imshow(window_name, cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
+                # Check if window was closed
+                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    include_points.clear()
+                    exclude_points.clear()
+                    break
 
-        cv2.destroyWindow(window_name)
+                if key in (13, 32):  # Enter or Space
+                    break
+                elif key in (27, ord('q'), ord('Q')):  # Escape or Q
+                    include_points.clear()
+                    exclude_points.clear()
+                    break
+                elif key == ord('r') or key == ord('R'):  # Reset
+                    display = original_display.copy()
+                    include_points.clear()
+                    exclude_points.clear()
+                    cv2.imshow(window_name, cv2.cvtColor(display, cv2.COLOR_RGB2BGR))
+                    print("  Points reset")
+
+        except KeyboardInterrupt:
+            include_points.clear()
+            exclude_points.clear()
+
+        finally:
+            try:
+                cv2.destroyWindow(window_name)
+            except Exception:
+                pass
 
         return include_points, exclude_points
 

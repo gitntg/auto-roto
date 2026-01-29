@@ -106,45 +106,62 @@ MATANYONE SETTINGS (auto-detected by resolution):
 
 def main():
     """Main entry point for interactive CLI."""
-    # Check environment
-    check_conda_environment()
+    try:
+        # Check environment
+        check_conda_environment()
 
-    args = parse_args()
+        args = parse_args()
 
-    # Setup logging
-    logger = setup_cli_logging(args.verbose, getattr(args, 'debug', False))
+        # Setup logging
+        logger = setup_cli_logging(args.verbose, getattr(args, 'debug', False))
 
-    # Import pipeline
-    from auto_roto.pipelines.interactive_matanyone import InteractiveMatAnyonePipeline
+        # Import pipeline
+        from auto_roto.pipelines.interactive_matanyone import InteractiveMatAnyonePipeline
 
-    # Determine settings
-    warmup = args.warmup if args.warmup is not None else 10
-    erode = args.erode if args.erode is not None else 10
-    dilate = args.dilate if args.dilate is not None else 10
+        # Determine settings
+        warmup = args.warmup if args.warmup is not None else 10
+        erode = args.erode if args.erode is not None else 10
+        dilate = args.dilate if args.dilate is not None else 10
 
-    # Create pipeline
-    pipeline = InteractiveMatAnyonePipeline(
-        prompt=args.prompt,
-        warmup=warmup,
-        erode_kernel=erode,
-        dilate_kernel=dilate,
-        device=args.device,
-        output_format=args.format,
-        bit_depth=args.bit_depth,
-        matanyone_repo=args.matanyone_repo,
-        matanyone_checkpoint=args.matanyone_checkpoint,
-        logger=logger
-    )
+        # Create pipeline
+        pipeline = InteractiveMatAnyonePipeline(
+            prompt=args.prompt,
+            warmup=warmup,
+            erode_kernel=erode,
+            dilate_kernel=dilate,
+            device=args.device,
+            output_format=args.format,
+            bit_depth=args.bit_depth,
+            matanyone_repo=args.matanyone_repo,
+            matanyone_checkpoint=args.matanyone_checkpoint,
+            logger=logger
+        )
 
-    # Run pipeline
-    success = pipeline.run(
-        input_path=args.input,
-        output_dir=args.output,
-        auto_resolution_settings=not args.no_auto_settings,
-        verbose=args.verbose
-    )
+        # Run pipeline
+        success = pipeline.run(
+            input_path=args.input,
+            output_dir=args.output,
+            auto_resolution_settings=not args.no_auto_settings,
+            verbose=args.verbose
+        )
 
-    sys.exit(0 if success else 1)
+        sys.exit(0 if success else 1)
+
+    except KeyboardInterrupt:
+        print("\n\nCancelled by user.")
+        sys.exit(130)  # Standard exit code for Ctrl+C
+
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
+
+    finally:
+        # Clean up any remaining OpenCV windows
+        try:
+            import cv2
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
