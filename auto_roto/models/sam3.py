@@ -291,11 +291,11 @@ class SAM3Segmenter:
         labels: List[int]
     ) -> List[np.ndarray]:
         """
-        Segment image using text prompts with bounding box hints from points.
+        Segment image using text prompts, then refine with point prompts.
 
-        SAM3SemanticPredictor supports text + bboxes together (priority: bboxes > text).
-        This converts include points to small bounding boxes to guide segmentation.
-        Exclude points are applied as post-processing mask subtraction.
+        Two-stage workflow (SAM3's text and point modes are separate):
+        1. SAM3SemanticPredictor with text → initial mask
+        2. Base SAM Predictor with mask (256x256) + points → refined mask
 
         Args:
             image: RGB image (numpy array)
@@ -318,71 +318,93 @@ class SAM3Segmenter:
 
         h, w = image.shape[:2]
 
-        # Separate include and exclude points
-        include_points = [(x, y) for (x, y), lbl in zip(points, labels) if lbl == 1]
-        exclude_points = [(x, y) for (x, y), lbl in zip(points, labels) if lbl == 0]
-
-        # Convert include points to bounding boxes
-        # SAM3SemanticPredictor supports text + bboxes together
-        bboxes = None
-        if include_points:
-            box_size = max(30, min(h, w) // 20)  # Adaptive box size
-            bboxes = []
-            for x, y in include_points:
-                x1 = max(0, x - box_size)
-                y1 = max(0, y - box_size)
-                x2 = min(w, x + box_size)
-                y2 = min(h, y + box_size)
-                bboxes.append([x1, y1, x2, y2])
-            bboxes = np.array(bboxes, dtype=np.float32)
-            self.logger.info(f"  Created {len(bboxes)} bounding boxes from include points")
-
-        # Run SAM3 with text + bboxes
+        # =================================================================
+        # Stage 1: Get initial mask from text prompt
+        # =================================================================
+        self.logger.info("  Stage 1: Text-based segmentation...")
         self.image_predictor.set_image(image)
+        text_results = self.image_predictor(text=text_prompts)
 
-        if bboxes is not None:
-            # Use text + bboxes together
-            results = self.image_predictor(text=text_prompts, bboxes=bboxes)
-        else:
-            # Text only
-            results = self.image_predictor(text=text_prompts)
-
-        masks = []
-        for result in results:
+        initial_masks = []
+        for result in text_results:
             if result.masks is not None:
                 for mask in result.masks.data:
-                    masks.append(mask.cpu().numpy())
+                    initial_masks.append(mask.cpu().numpy())
 
-        if not masks:
-            self.logger.warning("No masks returned from SAM3")
+        if not initial_masks:
+            self.logger.warning("No masks from text prompt")
             return []
 
-        # Combine all masks
+        # Combine initial masks
         combined_mask = np.zeros((h, w), dtype=np.float32)
-        for m in masks:
+        for m in initial_masks:
             if m.shape != (h, w):
                 m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
             combined_mask = np.maximum(combined_mask, m.astype(np.float32))
 
-        # Apply exclude points as mask subtraction
-        if exclude_points:
-            self.logger.info(f"  Applying {len(exclude_points)} exclude points")
-            exclude_radius = max(25, min(h, w) // 15)  # Larger radius for exclusion
+        self.logger.info(f"  Initial mask from text: {len(initial_masks)} regions")
 
-            for x, y in exclude_points:
-                # Create circular exclusion region
-                y_coords, x_coords = np.ogrid[:h, :w]
-                dist_from_point = np.sqrt((x_coords - x) ** 2 + (y_coords - y) ** 2)
+        # =================================================================
+        # Stage 2: Refine with points using base SAM Predictor
+        # =================================================================
+        self.logger.info("  Stage 2: Point-based refinement...")
 
-                # Soft falloff for smoother edges
-                exclusion = np.clip(1 - dist_from_point / exclude_radius, 0, 1)
-                combined_mask = combined_mask * (1 - exclusion * 0.95)
+        # Prepare mask input: SAM expects (N, 256, 256) format
+        mask_lowres = cv2.resize(combined_mask, (256, 256), interpolation=cv2.INTER_LINEAR)
+        mask_lowres = (mask_lowres > 0.5).astype(np.float32)
+        mask_input = mask_lowres[np.newaxis, :, :]  # Shape: (1, 256, 256)
 
-        # Threshold to binary
-        combined_mask = (combined_mask > 0.5).astype(np.float32)
+        # Prepare points and labels
+        points_np = np.array(points, dtype=np.float32)
+        labels_np = np.array(labels, dtype=np.int32)
 
-        self.logger.info(f"Refined mask with {n_include} include boxes and {n_exclude} exclude regions")
-        return [combined_mask]
+        # Create base predictor for refinement if needed
+        if not hasattr(self, '_refine_predictor') or self._refine_predictor is None:
+            from ultralytics.models.sam import Predictor as SAMPredictor
+            overrides = dict(
+                conf=self.conf,
+                imgsz=self.imgsz,
+                retina_masks=self.retina_masks,
+                max_det=self.max_det,
+                task="segment",
+                mode="predict",
+                model=self.model_path,
+                half=self.half_precision,
+                device=self.device,
+            )
+            self._refine_predictor = SAMPredictor(overrides=overrides)
+            self.logger.info("  Created base SAM predictor for refinement")
+
+        # Set image on refine predictor
+        self._refine_predictor.set_image(image)
+
+        # Run refinement with mask + points
+        refine_results = self._refine_predictor(
+            points=points_np,
+            labels=labels_np,
+            masks=mask_input
+        )
+
+        refined_masks = []
+        for result in refine_results:
+            if result.masks is not None:
+                for mask in result.masks.data:
+                    refined_masks.append(mask.cpu().numpy())
+
+        if refined_masks:
+            # Combine refined masks
+            final_mask = np.zeros((h, w), dtype=np.float32)
+            for m in refined_masks:
+                if m.shape != (h, w):
+                    m = cv2.resize(m.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+                final_mask = np.maximum(final_mask, m.astype(np.float32))
+
+            final_mask = (final_mask > 0.5).astype(np.float32)
+            self.logger.info(f"  Refinement complete: {len(refined_masks)} masks")
+            return [final_mask]
+        else:
+            self.logger.warning("  No masks from refinement, returning initial mask")
+            return [(combined_mask > 0.5).astype(np.float32)]
 
     def segment_video_with_box(
         self,
@@ -544,6 +566,10 @@ class SAM3Segmenter:
             if self._video_predictor is not None:
                 del self._video_predictor
                 self._video_predictor = None
+
+            if hasattr(self, '_refine_predictor') and self._refine_predictor is not None:
+                del self._refine_predictor
+                self._refine_predictor = None
 
             self.logger.debug("SAM3Segmenter models released")
 
