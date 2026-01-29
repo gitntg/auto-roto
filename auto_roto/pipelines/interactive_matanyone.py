@@ -287,9 +287,7 @@ class InteractiveMatAnyonePipeline:
             for m in masks:
                 current_mask = np.maximum(current_mask, m.astype(np.float32))
 
-            # Refinement points (accumulated)
-            include_points = []
-            exclude_points = []
+            self._logger.info(f"  Initial segmentation: {len(masks)} regions found")
 
             while True:
                 # Save and show preview
@@ -307,43 +305,54 @@ class InteractiveMatAnyonePipeline:
                     self._logger.info("  Mask approved!")
                     return current_mask
 
-                elif choice == "add_points":
-                    # Interactive point selection
-                    new_include, new_exclude = self._interactive_point_selection(
-                        first_frame, current_mask
-                    )
+                elif choice == "add_prompt":
+                    # Add additional text prompts to capture more
+                    print("\nAdd text prompts to capture more regions.")
+                    print("Examples: 'hair', 'arm', 'hand', 'clothing', 'full body'")
+                    print("(Press Enter with empty input to cancel)")
 
-                    if new_include or new_exclude:
-                        include_points.extend(new_include)
-                        exclude_points.extend(new_exclude)
+                    new_prompt = input("Additional prompt: ").strip()
 
-                        self._logger.info(
-                            f"  Total points: {len(include_points)} include, "
-                            f"{len(exclude_points)} exclude"
-                        )
+                    if new_prompt:
+                        prompts.append(new_prompt)
+                        self._logger.info(f"  Added prompt: '{new_prompt}'")
+                        self._logger.info(f"  All prompts: {prompts}")
 
-                        # Re-run SAM3 with BOTH text prompts AND points together
-                        # This allows proper include/exclude refinement
-                        all_points = include_points + exclude_points
-                        all_labels = [1] * len(include_points) + [0] * len(exclude_points)
+                        # Re-run SAM3 with expanded prompts
+                        new_masks = sam3.segment_image_with_text(first_frame, prompts)
 
-                        if all_points:
-                            # Segment with combined text + point prompts
-                            refined_masks = sam3.segment_image_with_text_and_points(
-                                first_frame, prompts, all_points, all_labels
-                            )
-
-                            if refined_masks:
-                                # Use the refined masks (text + points combined)
-                                current_mask = np.zeros(first_frame.shape[:2], dtype=np.float32)
-                                for m in refined_masks:
-                                    current_mask = np.maximum(current_mask, m.astype(np.float32))
-
-                                self._logger.info("  Mask updated with text + point refinements")
-                            else:
-                                self._logger.warning("  No masks returned from refinement, keeping current")
+                        if new_masks:
+                            current_mask = np.zeros(first_frame.shape[:2], dtype=np.float32)
+                            for m in new_masks:
+                                current_mask = np.maximum(current_mask, m.astype(np.float32))
+                            self._logger.info(f"  Mask updated: {len(new_masks)} regions found")
+                        else:
+                            self._logger.warning("  No masks found with new prompts")
                     else:
-                        self._logger.info("  No points added")
+                        self._logger.info("  No prompt added")
+
+                elif choice == "more_sensitive":
+                    # Lower confidence threshold
+                    current_conf = sam3.conf
+                    new_conf = max(0.05, current_conf - 0.1)
+                    sam3.conf = new_conf
+
+                    # Update predictor conf if loaded
+                    if sam3._image_predictor is not None:
+                        sam3._image_predictor.args.conf = new_conf
+
+                    self._logger.info(f"  Sensitivity: conf {current_conf:.2f} → {new_conf:.2f} (lower = more sensitive)")
+
+                    # Re-run with lower threshold
+                    new_masks = sam3.segment_image_with_text(first_frame, prompts)
+
+                    if new_masks:
+                        current_mask = np.zeros(first_frame.shape[:2], dtype=np.float32)
+                        for m in new_masks:
+                            current_mask = np.maximum(current_mask, m.astype(np.float32))
+                        self._logger.info(f"  Mask updated: {len(new_masks)} regions found")
+                    else:
+                        self._logger.warning("  No masks found at lower confidence")
 
                 elif choice == "quit":
                     self._logger.info("  User cancelled")
@@ -393,26 +402,27 @@ class InteractiveMatAnyonePipeline:
         print("REVIEW FIRST-FRAME MASK")
         print("=" * 50)
         print("  [A] Accept - proceed to MatAnyone")
-        print("  [P] Add points - refine with include/exclude points")
-        print("  [Q] Quit - cancel pipeline (or Ctrl+C / ESC)")
+        print("  [P] Add prompt - add text prompts (e.g. 'hair', 'arm')")
+        print("  [S] More sensitive - lower confidence threshold")
+        print("  [Q] Quit - cancel pipeline (or Ctrl+C)")
         print("=" * 50)
 
         while True:
             try:
-                choice = input("Your choice (A/P/Q): ").strip().upper()
+                choice = input("Your choice (A/P/S/Q): ").strip().upper()
 
                 if choice in ("A", "ACCEPT"):
                     return "accept"
-                elif choice in ("P", "POINTS", "ADD"):
-                    return "add_points"
+                elif choice in ("P", "PROMPT", "ADD"):
+                    return "add_prompt"
+                elif choice in ("S", "SENSITIVE", "MORE"):
+                    return "more_sensitive"
                 elif choice in ("Q", "QUIT", "EXIT", ""):
-                    # Empty string can happen if user presses Ctrl+C during input
                     return "quit"
                 else:
-                    print("Invalid choice. Please enter A, P, or Q.")
+                    print("Invalid choice. Please enter A, P, S, or Q.")
 
             except (KeyboardInterrupt, EOFError):
-                # Handle Ctrl+C or Ctrl+D during input
                 print("\n")
                 return "quit"
 
