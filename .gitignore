@@ -79,6 +79,7 @@ weights/
 
 # Output directories (generated during processing)
 *_roto/
+!auto_roto/
 *_refined/
 *_depth_refined*/
 test_output*/
@@ -107,12 +108,17 @@ $CLAUDE_ENV_FILE
 # Temp/null files
 nul
 
+# Archive of old scripts (to be deleted)
+_archive/
+
 # Cloned dependency repos (install separately)
 Depth-Anything-V2/
 depth-anything-3/
 GroundingDINO/
 sam2_repo/
 segment-anything-2/
+MatAnyone/
+MatAnyone2/
 
 # Logs
 *.log
