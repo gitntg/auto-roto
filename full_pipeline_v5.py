@@ -42,6 +42,9 @@ License: MIT
 """
 
 import os
+
+os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
+
 import sys
 import argparse
 import subprocess
@@ -98,6 +101,7 @@ class PipelineConfig:
     box: str = ""
     interactive: bool = False
     interactive_points: bool = False  # Include/exclude point marking mode
+    detail_points: bool = False  # Supplementary point marking for missed details
 
     # Quality preset
     quality: str = "standard"  # draft, standard, high, ultra
@@ -377,6 +381,59 @@ def run_python_stage(
     return run_stage(cmd, stage_name, verbose)
 
 
+def _load_alpha_mask(filepath: Path) -> 'np.ndarray | None':
+    """
+    Read a single-channel alpha mask from any supported format.
+
+    Uses OpenEXR library for .exr files (bypasses the ultralytics cv2.imread
+    patch which routes through cv2.imdecode — that path does not support EXR).
+    Falls back to cv2 for PNG/TIFF/etc.
+
+    Returns:
+        float32 2-D array (H, W) in [0, 1], or None on failure.
+    """
+    import numpy as np
+
+    filepath = Path(filepath)
+
+    if filepath.suffix.lower() == ".exr":
+        try:
+            import OpenEXR
+            import Imath
+
+            exr = OpenEXR.InputFile(str(filepath))
+            header = exr.header()
+            dw = header['dataWindow']
+            w = dw.max.x - dw.min.x + 1
+            h = dw.max.y - dw.min.y + 1
+
+            channels = header['channels']
+            ch_name = 'A' if 'A' in channels else list(channels.keys())[0]
+
+            pt = channels[ch_name].type
+            dtype = np.float16 if pt == Imath.PixelType(Imath.PixelType.HALF) else np.float32
+
+            raw = exr.channel(ch_name)
+            exr.close()
+            return np.frombuffer(raw, dtype=dtype).reshape(h, w).astype(np.float32)
+        except Exception:
+            return None
+    else:
+        import cv2
+        img = cv2.imread(str(filepath), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+        if img.dtype == np.uint8:
+            out = img.astype(np.float32) / 255.0
+        elif img.dtype == np.uint16:
+            out = img.astype(np.float32) / 65535.0
+        else:
+            out = img.astype(np.float32)
+        if out.ndim == 3:
+            out = out[:, :, 0]
+        return out
+
+
 def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
     """
     Run SAM3 segmentation with built-in text prompting.
@@ -522,6 +579,121 @@ def run_sam3_stage(config: PipelineConfig, output_dir: Path) -> bool:
                 if idx % 10 == 0:
                     logger.info(f"  Frame {idx}/{len(frames)}")
 
+        # =====================================================================
+        # Detail Points: supplementary point pass to capture missed details
+        # =====================================================================
+        if config.detail_points and not use_interactive_points:
+            from auto_roto import interactive_point_selection
+
+            logger.info("\n--- Detail Points: supplementary pass ---")
+
+            # Load first frame for point selection
+            first_frame = None
+            if input_path.is_dir():
+                frames_list = sorted(
+                    list(input_path.glob("*.png")) +
+                    list(input_path.glob("*.jpg")) +
+                    list(input_path.glob("*.jpeg"))
+                )
+                if frames_list:
+                    first_frame = cv2.imread(str(frames_list[0]))
+                    if first_frame is not None:
+                        first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+            else:
+                cap = cv2.VideoCapture(str(input_path))
+                ret, raw = cap.read()
+                cap.release()
+                if ret:
+                    first_frame = cv2.cvtColor(raw, cv2.COLOR_BGR2RGB)
+
+            if first_frame is None:
+                logger.warning("Could not read first frame for detail points; skipping")
+            else:
+                # Load existing SAM3 mask for the first frame and show as overlay
+                first_mask_path = sorted(alpha_dir.glob("roto.*"))[0] if list(alpha_dir.glob("roto.*")) else None
+                overlay_frame = first_frame.copy()
+
+                if first_mask_path is not None:
+                    mask_f = _load_alpha_mask(first_mask_path)
+                    if mask_f is not None:
+                        # Semi-transparent green overlay so user sees what's already captured
+                        green = np.zeros_like(first_frame)
+                        green[:, :, 1] = 255
+                        alpha_blend = 0.35
+                        mask_3ch = np.stack([mask_f] * 3, axis=-1)
+                        overlay_frame = (
+                            first_frame.astype(np.float32) * (1 - mask_3ch * alpha_blend) +
+                            green.astype(np.float32) * (mask_3ch * alpha_blend)
+                        ).astype(np.uint8)
+
+                logger.info("Opening point selector – click on missed details (drawstrings, etc.)")
+                points, labels = interactive_point_selection(overlay_frame, logger)
+
+                if points:
+                    logger.info(f"Running detail SAM3 pass with {len(points)} points...")
+
+                    if input_path.is_dir():
+                        frame_files = sorted(
+                            list(input_path.glob("*.png")) +
+                            list(input_path.glob("*.jpg")) +
+                            list(input_path.glob("*.jpeg"))
+                        )
+                        for idx, frame_file in enumerate(frame_files):
+                            frame = cv2.imread(str(frame_file))
+                            if frame is None:
+                                continue
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                            detail_masks = sam3.segment_image_with_points(frame_rgb, points, labels)
+                            if detail_masks:
+                                detail_combined = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                                for dm in detail_masks:
+                                    detail_combined = np.maximum(detail_combined, dm.astype(np.float32))
+
+                                # Load existing text-pass mask and merge
+                                existing_path = alpha_dir / f"roto.{idx:04d}.{config.output_format}"
+                                existing = _load_alpha_mask(existing_path) if existing_path.exists() else None
+                                if existing is not None:
+                                    merged = np.maximum(existing, detail_combined)
+                                    writer.write_alpha(merged, idx)
+                                else:
+                                    writer.write_alpha(detail_combined, idx)
+
+                            if idx % 10 == 0:
+                                logger.info(f"  Detail pass frame {idx}/{len(frame_files)}")
+                    else:
+                        # Video file
+                        cap = cv2.VideoCapture(str(input_path))
+                        idx = 0
+                        while True:
+                            ret, frame = cap.read()
+                            if not ret:
+                                break
+                            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                            detail_masks = sam3.segment_image_with_points(frame_rgb, points, labels)
+                            if detail_masks:
+                                detail_combined = np.zeros(frame_rgb.shape[:2], dtype=np.float32)
+                                for dm in detail_masks:
+                                    detail_combined = np.maximum(detail_combined, dm.astype(np.float32))
+
+                                existing_path = alpha_dir / f"roto.{idx:04d}.{config.output_format}"
+                                existing = _load_alpha_mask(existing_path) if existing_path.exists() else None
+                                if existing is not None:
+                                    merged = np.maximum(existing, detail_combined)
+                                    writer.write_alpha(merged, idx)
+                                else:
+                                    writer.write_alpha(detail_combined, idx)
+
+                            if idx % 10 == 0:
+                                logger.info(f"  Detail pass frame {idx}")
+                            idx += 1
+                        cap.release()
+
+                    logger.info("Detail points merge complete")
+                else:
+                    logger.info("No detail points selected; skipping merge")
+
         # Cleanup
         sam3.release()
 
@@ -630,6 +802,8 @@ def run_pipeline(config: PipelineConfig):
     logger.info(f"Refiner: {config.refiner}")
     if config.depth_first:
         logger.info("Depth Mode: PURE (runs before SAM, no alpha)")
+    if config.detail_points:
+        logger.info("Detail Points: ENABLED (supplementary point pass after main SAM)")
     logger.info("="*60)
 
     # =========================================================================
@@ -1025,6 +1199,11 @@ NOTE: SAM3 includes built-in text prompting (270k+ concepts).
     prompt_group.add_argument("--interactive-points", action="store_true",
                              help="Interactive point marking (LEFT=include, RIGHT=exclude)")
 
+    # Supplementary detail points (works alongside --prompt/--box)
+    parser.add_argument("--detail-points", action="store_true",
+                       help="After text/box detection, mark additional detail points "
+                            "(drawstrings, accessories, etc.) to merge into the mask")
+
     # Quality
     parser.add_argument("--quality", "-q",
                        choices=["draft", "standard", "high", "ultra"],
@@ -1153,6 +1332,7 @@ def main():
         box=args.box or "",
         interactive=args.interactive,
         interactive_points=args.interactive_points,
+        detail_points=args.detail_points,
         quality=args.quality,
         skip_sam=args.skip_sam,
         clean_output=args.clean,

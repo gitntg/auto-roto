@@ -1334,6 +1334,11 @@ class GeometricMatteRefiner:
             curr_frame_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
             prev_frame_gray = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2GRAY)
 
+        depth = depth.astype(np.float32)
+        p_low, p_high = np.percentile(depth, [2.0, 98.0])
+        depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
+        depth = 1.0 - depth
+
         # Step 2: Synthesize trimap
         self.logger.debug("Synthesizing trimap...")
         trimap = self.trimap_synth.synthesize(

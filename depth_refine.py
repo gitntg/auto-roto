@@ -117,8 +117,8 @@ class DepthRefineConfig:
     # These control how DA3 processes images for fine detail capture
     depth_process_res: Optional[int] = None   # None = auto (image size), or explicit value like 1024, 2048
     depth_process_method: str = "upper"       # "upper" or "lower" bound resize
-    depth_norm_percentiles: Tuple[float, float] = (2.0, 98.0)  # Percentiles for normalization
-    use_depth_confidence: bool = False        # Use DA3 confidence maps for filtering
+    depth_norm_percentiles: Tuple[float, float] = (2.0, 98.0)  # Visualization percentiles (preview only; EXR is raw)
+    use_depth_confidence: bool = False        # Extract confidence maps (does not modify depth)
 
     # Refinement settings
     edge_threshold: float = 0.1   # Depth gradient threshold for edges
@@ -313,20 +313,9 @@ class DepthEstimator:
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Normalize to 0-1 using configurable percentiles
-        # Wider percentiles (e.g., 0.5, 99.5) preserve more depth variation for fine details
-        # Narrower percentiles (e.g., 2, 98) are more robust to outliers
-        p_low, p_high = np.percentile(depth, list(self.norm_percentiles))
-        depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
-
-        # Optional: Apply confidence weighting to reduce noise in uncertain regions
-        if confidence is not None and self.use_confidence:
-            # Weight depth by confidence (high confidence = keep depth, low = smooth toward mean)
-            # This helps reduce noise at fine edges like hair strands
-            depth_mean = np.mean(depth)
-            confidence_weight = np.clip(confidence, 0.3, 1.0)  # Floor at 0.3 to avoid zeroing out
-            depth = depth * confidence_weight + depth_mean * (1 - confidence_weight)
-            self.logger.debug(f"Applied confidence weighting to depth")
+        # IMPORTANT: Follow official DA3 behavior.
+        # DepthAnything3 returns depth as float32. We treat this as the canonical output and do NOT normalize
+        # or post-process it here. Any normalization should be done only for visualization/preview.
 
         # Note: DA3 outputs depth (not disparity), so closer = LOWER values
         # This is the standard depth convention - no inversion needed
@@ -335,82 +324,6 @@ class DepthEstimator:
             return depth.astype(np.float32), confidence
         return depth.astype(np.float32)
 
-    def normalize_for_foreground(
-        self,
-        depth: np.ndarray,
-        mask: np.ndarray,
-        foreground_range: tuple = (0.0, 0.4)
-    ) -> np.ndarray:
-        """
-        Re-normalize depth to expand foreground detail.
-
-        Standard depth normalization may compress foreground variation.
-        This method expands the foreground region (where mask > 0.5) to use
-        more of the 0-1 range, preserving fine detail like hair.
-
-        Note: Depth convention is closer = LOWER values (foreground is low).
-
-        Args:
-            depth: Depth map (H, W), normalized 0-1 (closer = lower)
-            mask: Alpha mask (H, W) where foreground > 0.5
-            foreground_range: Target range for foreground depths (default 0.0-0.4)
-
-        Returns:
-            Re-normalized depth map with expanded foreground detail
-        """
-        import cv2
-
-        # Get foreground pixels
-        fg_mask = mask > 0.5
-        if not np.any(fg_mask):
-            return depth
-
-        fg_depths = depth[fg_mask]
-
-        # Find foreground depth range (use percentiles for robustness)
-        # Foreground (close) has LOW depth values
-        fg_min = np.percentile(fg_depths, 5)
-        fg_max = np.percentile(fg_depths, 95)
-        fg_range = fg_max - fg_min
-
-        if fg_range < 0.01:
-            # Foreground has no depth variation, can't enhance
-            return depth
-
-        # Target range for foreground
-        target_min, target_max = foreground_range
-        target_range = target_max - target_min
-
-        # Create enhanced depth
-        enhanced = depth.copy()
-
-        # Scale foreground depths to target range
-        # fg_depths: [fg_min, fg_max] -> [target_min, target_max]
-        scale = target_range / fg_range
-        enhanced = (depth - fg_min) * scale + target_min
-
-        # Background depths (> fg_max) get compressed into remaining range [target_max, 1.0]
-        # With standard depth: background = HIGH values, foreground = LOW values
-        bg_mask = depth > fg_max
-        if np.any(bg_mask):
-            bg_min_orig = fg_max
-            bg_max_orig = depth.max()
-            bg_range_orig = bg_max_orig - bg_min_orig + 1e-8
-
-            # Map background to [target_max, 1.0]
-            bg_scale = (1.0 - target_max) / bg_range_orig
-            enhanced[bg_mask] = (depth[bg_mask] - bg_min_orig) * bg_scale + target_max
-
-        # Clip to valid range
-        enhanced = np.clip(enhanced, 0, 1)
-
-        self.logger.debug(
-            f"Foreground depth enhancement: [{fg_min:.3f}, {fg_max:.3f}] -> "
-            f"[{target_min:.3f}, {target_max:.3f}], scale={scale:.2f}x"
-        )
-
-        return enhanced.astype(np.float32)
-    
     def estimate_batch(self, images: List[np.ndarray]) -> List[np.ndarray]:
         """Estimate depth for a batch of images."""
         # For now, process sequentially (batching requires more memory management)
@@ -456,8 +369,7 @@ class DepthEstimator:
         self,
         image: np.ndarray,
         tile_size: int = None,
-        overlap: int = None,
-        mask: np.ndarray = None
+        overlap: int = None
     ) -> np.ndarray:
         """
         Estimate depth at higher resolution.
@@ -469,7 +381,6 @@ class DepthEstimator:
             image: RGB image (H, W, 3), uint8
             tile_size: Size of each tile (default: 2048, or process_res if set)
             overlap: Overlap between tiles for blending (default: tile_size // 4)
-            mask: Optional alpha mask - prioritize tiles overlapping mask edges
 
         Returns:
             High-resolution depth map (H, W), float32, normalized 0-1
@@ -587,13 +498,7 @@ class DepthEstimator:
         # Normalize
         depth = (depth_sum / weight_sum).astype(np.float32)
 
-        # Normalize to 0-1
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-
-        # Post-process: Edge-preserving smoothing to reduce noise in uniform regions
-        # Bilateral filter preserves depth edges while smoothing noise
-        # Use float32 directly for full precision (sigmaColor in 0-1 range)
-        depth = cv2.bilateralFilter(depth, d=9, sigmaColor=0.1, sigmaSpace=25)
+        # IMPORTANT: For best-practice DA3 depth output, do not normalize or filter.
 
         self.logger.info(f"High-res depth: processed {tiles_processed} tiles at {tile_size}x{tile_size}")
 
@@ -835,6 +740,82 @@ class DepthGuidedRefiner:
         
         return edge_magnitude
     
+    def normalize_depth_for_foreground(
+        self,
+        depth: np.ndarray,
+        mask: np.ndarray,
+        foreground_range: tuple = (0.0, 0.4)
+    ) -> np.ndarray:
+        """
+        Re-normalize depth to expand foreground detail.
+
+        Standard depth normalization may compress foreground variation.
+        This method expands the foreground region (where mask > 0.5) to use
+        more of the 0-1 range, preserving fine detail like hair.
+
+        Note: Depth convention is closer = LOWER values (foreground is low).
+
+        Args:
+            depth: Depth map (H, W), normalized 0-1 (closer = lower)
+            mask: Alpha mask (H, W) where foreground > 0.5
+            foreground_range: Target range for foreground depths (default 0.0-0.4)
+
+        Returns:
+            Re-normalized depth map with expanded foreground detail
+        """
+        import cv2
+
+        # Get foreground pixels
+        fg_mask = mask > 0.5
+        if not np.any(fg_mask):
+            return depth
+
+        fg_depths = depth[fg_mask]
+
+        # Find foreground depth range (use percentiles for robustness)
+        # Foreground (close) has LOW depth values
+        fg_min = np.percentile(fg_depths, 5)
+        fg_max = np.percentile(fg_depths, 95)
+        fg_range = fg_max - fg_min
+
+        if fg_range < 0.01:
+            # Foreground has no depth variation, can't enhance
+            return depth
+
+        # Target range for foreground
+        target_min, target_max = foreground_range
+        target_range = target_max - target_min
+
+        # Create enhanced depth
+        enhanced = depth.copy()
+
+        # Scale foreground depths to target range
+        # fg_depths: [fg_min, fg_max] -> [target_min, target_max]
+        scale = target_range / fg_range
+        enhanced = (depth - fg_min) * scale + target_min
+
+        # Background depths (> fg_max) get compressed into remaining range [target_max, 1.0]
+        # With standard depth: background = HIGH values, foreground = LOW values
+        bg_mask = depth > fg_max
+        if np.any(bg_mask):
+            bg_min_orig = fg_max
+            bg_max_orig = depth.max()
+            bg_range_orig = bg_max_orig - bg_min_orig + 1e-8
+
+            # Map background to [target_max, 1.0]
+            bg_scale = (1.0 - target_max) / bg_range_orig
+            enhanced[bg_mask] = (depth[bg_mask] - bg_min_orig) * bg_scale + target_max
+
+        # Clip to valid range
+        enhanced = np.clip(enhanced, 0, 1)
+
+        self.logger.debug(
+            f"Foreground depth enhancement: [{fg_min:.3f}, {fg_max:.3f}] -> "
+            f"[{target_min:.3f}, {target_max:.3f}], scale={scale:.2f}x"
+        )
+
+        return enhanced.astype(np.float32)
+
     def _create_core_matte(
         self,
         alpha: np.ndarray,
@@ -1224,7 +1205,8 @@ class DepthGuidedRefiner:
         self,
         alpha: np.ndarray,
         depth: np.ndarray,
-        rgb: np.ndarray = None
+        rgb: np.ndarray = None,
+        normalize_depth: bool = False
     ) -> np.ndarray:
         """
         Refine alpha matte using PROFESSIONAL KEYING WORKFLOW with FLOAT DEPTH.
@@ -1235,33 +1217,26 @@ class DepthGuidedRefiner:
             Eroded SAM2 mask → 100% solid, never touches edges
 
         Stage 2 - DEPTH-GATED EDGE MATTE:
-            Uses FLOAT depth values for precise foreground/background separation
-            Only pixels with matching foreground depth are considered
-
-        Stage 3 - HAIR-SPECIFIC DETECTION:
-            Texture analysis for fine hair strands
-            Color matching for hair color continuity
-            Focused on hair region (top of subject)
-
-        Stage 4 - COMBINE (Matte Logic):
-            MAX(core, edge, hair) with proper weighting
-
         Args:
-            alpha: Alpha matte (H, W), values 0-1
-            depth: FLOAT depth map (H, W), values 0-1 (NOT colorized!)
-            rgb: Optional RGB image for hair detection
+            alpha: Input alpha matte (H, W), 0-1
+            depth: Input depth map (H, W), 0-1 (closer = LOWER)
+            rgb: Optional RGB image for color-guided refinement
+            normalize_depth: If True, expand foreground depth detail using alpha
 
         Returns:
-            Combined alpha matte (H, W), values 0-1
+            Refined alpha matte (H, W), 0-1
         """
         import cv2
 
-        # Normalize inputs
-        alpha = alpha.astype(np.float32)
+        # Step 0: Optional depth normalization for foreground detail
+        if normalize_depth:
+            depth = self.normalize_depth_for_foreground(depth, alpha)
+
+        # Step 1: Create core matte (solid part of mask)
+        core_matte, mask_binary = self._create_core_matte(alpha).astype(np.float32)
         depth = depth.astype(np.float32)
         if depth.max() > 1.0:
-            self.logger.warning("Depth values > 1.0 detected - normalizing. Ensure float depth is used!")
-            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+            self.logger.warning("Depth values > 1.0 detected - expected normalized depth for refinement")
 
         # Stage 1: Create core matte
         core_matte, mask_binary = self._create_core_matte(alpha)
@@ -1420,7 +1395,10 @@ def load_alpha_sequence(alpha_dir: str) -> Generator[Tuple[int, np.ndarray, Path
 def load_depth_map(depth_path: Path) -> np.ndarray:
     """Load a depth map from file."""
     import cv2
-    
+
+    if depth_path.suffix.lower() == '.exr':
+        return load_depth_float(depth_path)
+
     depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
     
     if depth is None:
@@ -1430,14 +1408,7 @@ def load_depth_map(depth_path: Path) -> np.ndarray:
     if len(depth.shape) == 3:
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
     
-    # Normalize to 0-1
-    if depth.dtype == np.uint8:
-        depth = depth.astype(np.float32) / 255.0
-    elif depth.dtype == np.uint16:
-        depth = depth.astype(np.float32) / 65535.0
-    else:
-        depth = depth.astype(np.float32)
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+    depth = depth.astype(np.float32)
     
     return depth
 
@@ -1496,7 +1467,7 @@ def save_depth_float(
     depth: np.ndarray,
     filepath: Path,
 ):
-    """Save depth map as float EXR for proper precision."""
+    """Save depth map as float EXR (single channel) for proper precision."""
     try:
         import OpenEXR
         import Imath
@@ -1506,6 +1477,7 @@ def save_depth_float(
 
         header = OpenEXR.Header(w, h)
         pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+        # Strictly single channel 'Y' for depth data
         header['channels'] = {'Y': Imath.Channel(pixel_type)}
 
         exr = OpenEXR.OutputFile(str(filepath), header)
@@ -1513,7 +1485,7 @@ def save_depth_float(
         exr.close()
 
     except ImportError:
-        # Fallback to 16-bit PNG (loses some precision but still usable)
+        # Fallback to 16-bit PNG (grayscale)
         import cv2
         depth_16 = (depth * 65535).astype(np.uint16)
         cv2.imwrite(str(filepath), depth_16)
@@ -1522,13 +1494,19 @@ def save_depth_float(
 def save_depth_visualization(
     depth: np.ndarray,
     filepath: Path,
-    colormap: bool = True
+    colormap: bool = True,
+    percentiles: Tuple[float, float] = (2.0, 98.0)
 ):
     """Save depth map as colorized visualization (for preview only).
     
     Uses 16-bit output to minimize banding artifacts in gradients.
     """
     import cv2
+
+    # Visualization only: normalize for display.
+    depth_float = depth.astype(np.float32)
+    p_low, p_high = np.percentile(depth_float, list(percentiles))
+    depth_vis_norm = np.clip((depth_float - p_low) / (p_high - p_low + 1e-8), 0, 1)
 
     if colormap:
         # Use matplotlib's colormap for smooth gradients
@@ -1538,7 +1516,7 @@ def save_depth_visualization(
             
             # Apply inferno colormap with full float precision
             cmap = cm.get_cmap('inferno')
-            depth_colored = cmap(depth)  # Returns RGBA float [0,1]
+            depth_colored = cmap(depth_vis_norm)  # Returns RGBA float [0,1]
             
             # Convert to BGR 16-bit for minimal banding (65536 levels per channel)
             depth_vis = (depth_colored[:, :, :3] * 65535).astype(np.uint16)
@@ -1546,16 +1524,16 @@ def save_depth_visualization(
             
         except ImportError:
             # Fallback: grayscale 16-bit if matplotlib unavailable
-            depth_vis = (depth * 65535).astype(np.uint16)
+            depth_vis = (depth_vis_norm * 65535).astype(np.uint16)
     else:
         # Grayscale 16-bit (no colormap)
-        depth_vis = (depth * 65535).astype(np.uint16)
+        depth_vis = (depth_vis_norm * 65535).astype(np.uint16)
 
     cv2.imwrite(str(filepath), depth_vis)
 
 
 def load_depth_float(filepath: Path) -> np.ndarray:
-    """Load depth map as float values (0-1 range)."""
+    """Load depth map as float values (raw DA3 depth)."""
     import cv2
 
     ext = filepath.suffix.lower()
@@ -1596,14 +1574,11 @@ def load_depth_float(filepath: Path) -> np.ndarray:
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
 
     if depth.dtype == np.uint8:
-        depth = depth.astype(np.float32) / 255.0
+        depth = depth.astype(np.float32)
     elif depth.dtype == np.uint16:
-        depth = depth.astype(np.float32) / 65535.0
+        depth = depth.astype(np.float32)
     else:
         depth = depth.astype(np.float32)
-        # Normalize if not already 0-1
-        if depth.max() > 1.0:
-            depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
 
     return depth
 
@@ -1657,6 +1632,11 @@ class DepthRefinePipeline:
     def run(self):
         """Run the depth refinement pipeline."""
         import cv2
+
+        def _normalize_depth_for_refine(depth_raw: np.ndarray) -> np.ndarray:
+            d = depth_raw.astype(np.float32)
+            p_low, p_high = np.percentile(d, list(self.config.depth_norm_percentiles))
+            return np.clip((d - p_low) / (p_high - p_low + 1e-8), 0, 1).astype(np.float32)
         
         self.logger.info("="*60)
         self.logger.info("Depth-Guided Alpha Refinement")
@@ -1703,72 +1683,87 @@ class DepthRefinePipeline:
                 frame_files = sorted(set(frame_files))
                 self.logger.info(f"Found {len(frame_files)} source frames")
 
-        # Process each alpha
+        # Process depth computation/generation
+        if self.config.compute_depth and not has_precomputed_depth:
+            self.logger.info("Generating depth maps from frames...")
+            for idx, frame_path in enumerate(frame_files):
+                self.logger.info(f"Processing frame {idx}: {frame_path.name}")
+                
+                frame = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
+                if frame is None:
+                    self.logger.warning(f"Could not read frame {frame_path}, skipping")
+                    continue
+                
+                if frame.dtype == np.uint16:
+                    frame = (frame / 256).astype(np.uint8)
+                if len(frame.shape) == 2:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+                else:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                self.logger.debug(f"  Computing depth from {frame_path.name}...")
+                depth = self.depth_estimator.estimate_high_res(frame)
+
+                if self.config.save_depth:
+                    depth_float_path = depth_dir / f"depth.{idx:04d}.exr"
+                    save_depth_float(depth, depth_float_path)
+                    depth_vis_path = depth_dir / f"depth_preview.{idx:04d}.png"
+                    save_depth_visualization(depth, depth_vis_path, percentiles=self.config.depth_norm_percentiles)
+
+            if self.config.depth_only:
+                self.logger.info("Depth generation complete (depth_only mode).")
+                return
+
+        # Process each alpha (if not depth_only)
         self.logger.info(f"Loading alpha mattes from: {self.config.alpha_dir}")
         
         for idx, alpha, alpha_path in load_alpha_sequence(self.config.alpha_dir):
-            self.logger.info(f"Processing frame {idx}: {alpha_path.name}")
+            self.logger.info(f"Refining alpha frame {idx}: {alpha_path.name}")
             
-            # Get or compute depth
+            # Get or compute depth for this specific alpha
             if has_precomputed_depth:
-                # Load precomputed depth
                 depth_files = list(Path(self.config.depth_dir).glob(f"*{idx:04d}*"))
                 if depth_files:
                     depth = load_depth_map(depth_files[0])
                 else:
-                    self.logger.warning(f"No depth map for frame {idx}, skipping")
+                    self.logger.warning(f"No depth map for frame {idx}, skipping refinement")
                     continue
             else:
-                # Compute depth from frame - use sorted frame file list by index
-                if idx < len(frame_files):
-                    frame_path = frame_files[idx]
-                    frame = cv2.imread(str(frame_path), cv2.IMREAD_UNCHANGED)
-                    if frame is None:
-                        self.logger.warning(f"Could not read frame {frame_path}, skipping")
-                        continue
-                    if frame.dtype == np.uint16:
-                        frame = (frame / 256).astype(np.uint8)
-                    if len(frame.shape) == 2:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-                    else:
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    self.logger.debug(f"  Computing depth from {frame_path.name}...")
-                    self.logger.debug(f"  Model: {self.config.depth_model}")
-                    # Use high-res depth estimation (pure depth, no alpha influence)
-                    depth = self.depth_estimator.estimate_high_res(frame)
-
-                    if self.config.save_depth:
-                        # Save float EXR for actual depth data (for reuse/processing)
-                        depth_float_path = depth_dir / f"depth.{idx:04d}.exr"
-                        save_depth_float(depth, depth_float_path)
-                        # Also save colorized visualization for preview
-                        depth_vis_path = depth_dir / f"depth_preview.{idx:04d}.png"
-                        save_depth_visualization(depth, depth_vis_path)
+                # Depth already generated in the first pass or needs to be loaded from cache
+                depth_float_path = depth_dir / f"depth.{idx:04d}.exr"
+                if depth_float_path.exists():
+                    depth = load_depth_float(depth_float_path)
                 else:
-                    self.logger.warning(f"No frame for depth computation at index {idx} (have {len(frame_files)} frames), skipping")
+                    self.logger.warning(f"Depth map not found for index {idx}, skipping refinement")
                     continue
 
-            # Skip alpha refinement if depth_only mode (pure depth output)
-            if not self.config.depth_only:
-                # Refine alpha - pass RGB frame for guided filtering
-                self.logger.debug(f"  Refining alpha with hair detection...")
-                rgb_for_refine = frame if 'frame' in locals() else None
-                refined = self.refiner.refine(alpha, depth, rgb=rgb_for_refine)
-                
-                # Save refined alpha
-                output_path = refined_dir / f"refined.{idx:04d}.{self.config.output_format}"
-                save_alpha(refined, output_path, self.config.bit_depth)
-                
-                # Save debug visualization
-                if self.config.save_debug:
-                    self._save_debug_vis(
-                        alpha, depth, refined,
-                        debug_dir / f"debug.{idx:04d}.jpg"
-                    )
+            # Refine alpha
+            self.logger.debug(f"  Refining alpha with hair detection...")
+            # We need to load the RGB frame for refinement if not already in memory
+            frame_path = frame_files[idx] if idx < len(frame_files) else None
+            rgb_frame = None
+            if frame_path:
+                rgb_frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
+                if rgb_frame is not None:
+                    rgb_frame = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+            
+            # Refiner expects normalized depth (0-1). Keep raw depth on disk.
+            depth_norm = _normalize_depth_for_refine(depth)
+            refined = self.refiner.refine(alpha, depth_norm, rgb=rgb_frame)
+            
+            # Save refined alpha
+            output_path = refined_dir / f"refined.{idx:04d}.{self.config.output_format}"
+            save_alpha(refined, output_path, self.config.bit_depth)
+            
+            # Save debug visualization
+            if self.config.save_debug:
+                self._save_debug_vis(
+                    alpha, depth, refined,
+                    debug_dir / f"debug.{idx:04d}.jpg"
+                )
             
             if idx % 10 == 0:
-                self.logger.info(f"  Processed {idx} frames...")
+                self.logger.info(f"  Refined {idx} frames...")
         
         self.logger.info("="*60)
         self.logger.info("Depth Refinement Complete!")

@@ -57,7 +57,7 @@ class DepthPassConfig:
     process_res: Optional[int] = None  # None = auto (use image size)
     process_method: str = "upper"      # "upper" or "lower" bound resize
     
-    # Normalization
+    # Visualization normalization (PNG preview only; EXR is always raw)
     norm_percentiles: Tuple[float, float] = (2.0, 98.0)
     
     # Export options
@@ -106,14 +106,12 @@ class DepthEstimator:
         device: str = 'cuda',
         process_res: Optional[int] = None,
         process_method: str = "upper",
-        norm_percentiles: Tuple[float, float] = (2.0, 98.0),
         logger: logging.Logger = None
     ):
         self.model_size = model_size
         self.device = device
         self.process_res = process_res
         self.process_method = process_method
-        self.norm_percentiles = norm_percentiles
         self.logger = logger or logging.getLogger("DepthEstimator")
         
         self.model = None
@@ -178,11 +176,7 @@ class DepthEstimator:
         # Resize to match input
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-        
-        # Normalize using percentiles
-        p_low, p_high = np.percentile(depth, list(self.norm_percentiles))
-        depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
-        
+
         return depth.astype(np.float32)
     
     def estimate_with_prediction(self, image: np.ndarray):
@@ -190,7 +184,7 @@ class DepthEstimator:
         Estimate depth and return full prediction object (for point cloud export).
         
         Returns:
-            (depth_normalized, prediction_object)
+            (depth_raw, prediction_object)
         """
         if image.dtype != np.uint8:
             if image.max() <= 1.0:
@@ -218,11 +212,94 @@ class DepthEstimator:
         
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        return depth.astype(np.float32), prediction
+    
+    def estimate_high_res(
+        self,
+        image: np.ndarray,
+        tile_size: int = None,
+        overlap: int = None
+    ) -> np.ndarray:
+        """
+        Estimate depth at higher resolution using tiled processing.
         
-        p_low, p_high = np.percentile(depth, list(self.norm_percentiles))
-        depth_norm = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
+        Args:
+            image: RGB image (H, W, 3), uint8
+            tile_size: Size of each tile (default: 2048)
+            overlap: Overlap between tiles for blending (default: tile_size // 2)
+            
+        Returns:
+            High-resolution depth map (H, W), float32, raw DA3 depth values
+        """
+        h, w = image.shape[:2]
         
-        return depth_norm.astype(np.float32), prediction
+        if tile_size is None:
+            tile_size = 2048
+            
+        if overlap is None:
+            overlap = tile_size // 2
+            
+        if h <= tile_size and w <= tile_size:
+            return self.estimate(image)
+            
+        depth_sum = np.zeros((h, w), dtype=np.float64)
+        weight_sum = np.zeros((h, w), dtype=np.float64)
+        
+        def create_weight_mask(th, tw):
+            feather = min(overlap, th // 2, tw // 2)
+            if feather <= 0:
+                return np.ones((th, tw), dtype=np.float32)
+            
+            def cosine_ramp(length, feather_size):
+                ramp = np.ones(length, dtype=np.float32)
+                if feather_size > 0 and length > 2 * feather_size:
+                    t = np.linspace(0, np.pi / 2, feather_size)
+                    fade_in = np.sin(t) ** 2
+                    ramp[:feather_size] = fade_in
+                    ramp[-feather_size:] = fade_in[::-1]
+                return ramp
+            
+            ramp_h = cosine_ramp(th, feather)
+            ramp_w = cosine_ramp(tw, feather)
+            return np.outer(ramp_h, ramp_w).astype(np.float32)
+            
+        step = tile_size - overlap
+        
+        for y in range(0, h, step):
+            for x in range(0, w, step):
+                y1, y2 = y, min(y + tile_size, h)
+                x1, x2 = x, min(x + tile_size, w)
+                
+                tile = image[y1:y2, x1:x2]
+                tile_h, tile_w = tile.shape[:2]
+                
+                if tile_h < tile_size or tile_w < tile_size:
+                    padded = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+                    padded[:tile_h, :tile_w] = tile
+                    if tile_h < tile_size:
+                        mirror_h = min(tile_h, tile_size - tile_h)
+                        padded[tile_h:tile_h + mirror_h, :tile_w] = tile[tile_h - mirror_h:tile_h, :][::-1]
+                    if tile_w < tile_size:
+                        mirror_w = min(tile_w, tile_size - tile_w)
+                        padded[:tile_h, tile_w:tile_w + mirror_w] = tile[:, tile_w - mirror_w:tile_w][:, ::-1]
+                    tile = padded
+                    
+                tile_depth = self.estimate(tile)
+                
+                if tile_depth.shape != (tile_size, tile_size):
+                    tile_depth = cv2.resize(tile_depth, (tile_size, tile_size), interpolation=cv2.INTER_LINEAR)
+                    
+                tile_depth = tile_depth[:tile_h, :tile_w]
+                weight = create_weight_mask(tile_h, tile_w)
+                
+                depth_sum[y1:y2, x1:x2] += tile_depth * weight
+                weight_sum[y1:y2, x1:x2] += weight
+                
+        weight_sum = np.maximum(weight_sum, 1e-8)
+        depth = (depth_sum / weight_sum).astype(np.float32)
+
+        return depth
     
     def release(self):
         """Release model and free GPU memory."""
@@ -244,7 +321,7 @@ class DepthEstimator:
 
 
 def save_depth_exr(depth: np.ndarray, filepath: Path):
-    """Save depth as float32 EXR."""
+    """Save depth as float32 EXR (single channel)."""
     try:
         import OpenEXR
         import Imath
@@ -252,6 +329,7 @@ def save_depth_exr(depth: np.ndarray, filepath: Path):
         h, w = depth.shape
         header = OpenEXR.Header(w, h)
         pixel_type = Imath.PixelType(Imath.PixelType.FLOAT)
+        # Strictly single channel 'Y' for depth
         header['channels'] = {'Y': Imath.Channel(pixel_type)}
         
         exr = OpenEXR.OutputFile(str(filepath), header)
@@ -259,21 +337,24 @@ def save_depth_exr(depth: np.ndarray, filepath: Path):
         exr.close()
         
     except ImportError:
-        # Fallback to 16-bit PNG
+        # Fallback to 16-bit PNG (grayscale)
         depth_16 = (depth * 65535).astype(np.uint16)
         cv2.imwrite(str(filepath).replace('.exr', '.png'), depth_16)
 
 
-def save_depth_visualization(depth: np.ndarray, filepath: Path):
+def save_depth_visualization(depth: np.ndarray, filepath: Path, percentiles: Tuple[float, float] = (2.0, 98.0)):
     """Save depth as colorized PNG visualization."""
+    depth_float = depth.astype(np.float32)
+    p_low, p_high = np.percentile(depth_float, list(percentiles))
+    depth_vis_norm = np.clip((depth_float - p_low) / (p_high - p_low + 1e-8), 0, 1)
     try:
         import matplotlib.cm as cm
         cmap = cm.get_cmap('inferno')
-        depth_colored = cmap(depth)
+        depth_colored = cmap(depth_vis_norm)
         depth_vis = (depth_colored[:, :, :3] * 255).astype(np.uint8)
         depth_vis = depth_vis[:, :, ::-1]  # RGB to BGR
     except ImportError:
-        depth_vis = (depth * 255).astype(np.uint8)
+        depth_vis = (depth_vis_norm * 255).astype(np.uint8)
         depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_INFERNO)
     
     cv2.imwrite(str(filepath), depth_vis)
@@ -368,7 +449,6 @@ class DepthPassPipeline:
             device=self.config.device,
             process_res=self.config.process_res,
             process_method=self.config.process_method,
-            norm_percentiles=self.config.norm_percentiles,
             logger=self.logger
         )
         
@@ -391,7 +471,7 @@ class DepthPassPipeline:
             # Save visualization
             if self.config.save_visualization:
                 vis_path = vis_dir / f"{name}.png"
-                save_depth_visualization(depth, vis_path)
+                save_depth_visualization(depth, vis_path, percentiles=self.config.norm_percentiles)
         
         # Export point cloud if requested
         if self.config.export_pointcloud and predictions:
@@ -484,7 +564,7 @@ EXAMPLES:
                        help="Resize method: 'lower' gives higher effective resolution")
     parser.add_argument("--percentiles", type=float, nargs=2, default=[2.0, 98.0],
                        metavar=("LOW", "HIGH"),
-                       help="Normalization percentiles (default: 2 98)")
+                       help="Visualization percentiles for PNG preview (default: 2 98). EXR depth is always raw.")
     
     # Point cloud export
     parser.add_argument("--export-pointcloud", action="store_true",

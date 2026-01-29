@@ -10,7 +10,7 @@ Built on SAM2 (Segment Anything Model 2.1) with ViTMatte for fine detail matting
 
 ---
 Path to full : F:/3DActive/CarCrash/reel-new/renders/scene-01nfp/
-
+ python full_pipeline_v5.py --input ./test_input --prompt "person" --detail-points --output ./output --quality ultra --refiner ma1
 ## Features
 
 - **Text-based detection** - "person", "car", "dog" -> instant roto via GroundingDINO
