@@ -11,8 +11,6 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import numpy as np
-
 from auto_roto.stages.base import PipelineStage, StageContext, StageResult, StageRegistry
 from auto_roto.config.depth import DepthRefineConfig
 
@@ -33,6 +31,7 @@ class DepthStage(PipelineStage):
     def __init__(
         self,
         config: DepthRefineConfig = None,
+        first_frame_only: bool = False,
         logger: logging.Logger = None
     ):
         """
@@ -40,10 +39,12 @@ class DepthStage(PipelineStage):
 
         Args:
             config: DepthRefineConfig instance (uses defaults if None)
+            first_frame_only: If True, only process the first frame (for MatAnyone mode)
             logger: Optional logger instance
         """
         super().__init__(logger)
         self.config = config or DepthRefineConfig()
+        self.first_frame_only = first_frame_only
 
     @property
     def name(self) -> str:
@@ -95,7 +96,7 @@ class DepthStage(PipelineStage):
 
         # Initialize depth estimator
         estimator = DepthEstimator(
-            model_type=self.config.depth_model,
+            model_size=self.config.depth_model,
             device=context.device,
             process_res=self.config.depth_process_res,
             process_method=self.config.depth_process_method,
@@ -104,6 +105,9 @@ class DepthStage(PipelineStage):
 
         try:
             frame_count = 0
+
+            if self.first_frame_only:
+                self._logger.info("First frame only mode (for MatAnyone)")
 
             if frames_dir.is_file():
                 # Video file - extract and process frames
@@ -121,10 +125,7 @@ class DepthStage(PipelineStage):
                     # Estimate depth
                     depth = estimator.estimate(rgb)
 
-                    # Normalize depth
-                    depth = self._normalize_depth(depth)
-
-                    # Save depth
+                    # Save depth (raw DA3 output, unnormalized)
                     depth_path = depth_dir / f"depth.{idx:04d}.exr"
                     save_depth_float(depth_path, depth)
 
@@ -132,9 +133,12 @@ class DepthStage(PipelineStage):
                         self._logger.info(f"  Frame {idx}")
 
                     idx += 1
+                    frame_count = idx
+
+                    if self.first_frame_only:
+                        break
 
                 cap.release()
-                frame_count = idx
 
             else:
                 # Frames directory
@@ -155,17 +159,17 @@ class DepthStage(PipelineStage):
                     # Estimate depth
                     depth = estimator.estimate(rgb)
 
-                    # Normalize depth
-                    depth = self._normalize_depth(depth)
-
-                    # Save depth
+                    # Save depth (raw DA3 output, unnormalized)
                     depth_out_path = depth_dir / f"depth.{idx:04d}.exr"
                     save_depth_float(depth_out_path, depth)
 
                     if idx % 10 == 0:
                         self._logger.info(f"  Frame {idx}/{len(frame_files)}")
 
-                frame_count = len(frame_files)
+                    frame_count = idx + 1
+
+                    if self.first_frame_only:
+                        break
 
             self._logger.info(f"Processed {frame_count} frames")
 
@@ -180,18 +184,6 @@ class DepthStage(PipelineStage):
 
         finally:
             estimator.release()
-
-    def _normalize_depth(self, depth: np.ndarray) -> np.ndarray:
-        """Normalize depth map to 0-1 range using percentiles."""
-        depth = depth.astype(np.float32)
-
-        p_low = self.config.depth_norm_percentiles[0]
-        p_high = self.config.depth_norm_percentiles[1]
-
-        low, high = np.percentile(depth, [p_low, p_high])
-        depth = np.clip((depth - low) / (high - low + 1e-8), 0, 1)
-
-        return depth
 
     def cleanup(self, context: StageContext):
         """Clear GPU memory after depth estimation."""

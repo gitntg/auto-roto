@@ -68,8 +68,14 @@ python -m auto_roto pipeline --input video.mp4 --prompt "person" --output ./outp
 # With quality preset
 python -m auto_roto pipeline --input video.mp4 --prompt "person" --quality high
 
-# Use MatAnyone instead of ViTMatte
+# Use MatAnyone instead of ViTMatte (per-frame refinement)
 python -m auto_roto pipeline --input video.mp4 --prompt "person" --refiner ma1
+
+# MatAnyone temporal mode: refine frame 1 only, propagate to all frames
+python -m auto_roto pipeline --input video.mp4 --prompt "person" --use-matanyone
+
+# MatAnyone temporal mode with custom settings
+python -m auto_roto pipeline --input video.mp4 --prompt "person" --use-matanyone --matanyone-mem-every 2
 ```
 
 ### Individual Commands
@@ -89,9 +95,21 @@ python -m auto_roto version
 
 ```python
 from auto_roto import FullPipeline, InteractiveMatAnyonePipeline
+from auto_roto.config.pipeline import PipelineConfig
 
-# Full pipeline
+# Full pipeline with ViTMatte
 pipeline = FullPipeline(prompts=["person"], quality="high")
+pipeline.run(input_path="video.mp4", output_dir="./output")
+
+# Full pipeline with MatAnyone temporal propagation
+config = PipelineConfig(
+    prompt="person",
+    quality="high",
+    use_matanyone=True,
+    matanyone_mem_every=3,
+    matanyone_max_mem_frames=10
+)
+pipeline = FullPipeline(config=config)
 pipeline.run(input_path="video.mp4", output_dir="./output")
 
 # Interactive pipeline
@@ -113,19 +131,28 @@ interactive.run(input_path="video.mp4", output_dir="./output")
 | Refiner | Best For | Flag |
 |---------|----------|------|
 | ViTMatte | Hair, fine details, static shots | `--refiner vitmatte` (default) |
-| MatAnyone | Temporal consistency, video | `--refiner ma1` |
+| MatAnyone (per-frame) | Temporal consistency, video | `--refiner ma1` |
+| MatAnyone (temporal) | Best quality video, refine once propagate all | `--use-matanyone` |
 | Interactive | Video with manual first-frame review | `interactive` command |
 
 ## Pipeline Stages
 
+**Standard Pipeline:**
 ```
 SAM3 → Depth → ViTMatte/MatAnyone → Combine → Final
+```
+
+**MatAnyone Temporal Mode (`--use-matanyone`):**
+```
+Frame 1:     SAM3 → Depth → ViTMatte → Combine → Best alpha
+All frames:  MatAnyone (propagate frame 1 alpha) → Final
 ```
 
 1. **SAM3** - Segment objects using text/box/point prompts
 2. **Depth** - Estimate depth maps with Depth Anything V3
 3. **ViTMatte** or **MatAnyone** - Refine alpha
 4. **Combine** - Produce final RGBA output with despill
+5. **MatAnyone** (temporal mode) - Propagate frame 1 alpha to all frames
 
 ## Output Structure
 
@@ -136,6 +163,17 @@ output/
 │   ├── rgba/       # RGBA composites
 │   ├── preview/    # Preview images
 │   └── depth/      # Depth maps
+```
+
+**Intermediate directories (with `--keep-intermediate`):**
+```
+output/
+├── 01_sam_output/alpha/        # SAM masks
+├── 02_depth_output/depth/      # Depth maps
+├── 03_vitmatte_output/alpha/   # ViTMatte refined alpha
+├── 04_combine_output/alpha/    # Combined output
+├── 05_matanyone_output/alpha/  # MatAnyone propagated (temporal mode)
+└── final/
 ```
 
 ## Requirements

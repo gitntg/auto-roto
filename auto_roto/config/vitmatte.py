@@ -6,7 +6,7 @@ Configuration for ViTMatte-based alpha refinement and trimap synthesis.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass
@@ -83,7 +83,8 @@ class ViTMatteConfig:
 
     model_size: str = "base"        # "small" or "base"
     device: str = "cuda"
-    max_resolution: int = 8192      # Max dimension for processing
+    max_resolution: int = 2048      # Max dimension for processing
+    use_fp16: bool = True           # Use half precision for lower VRAM
 
 
 @dataclass
@@ -92,6 +93,9 @@ class GeometricMatteConfig:
 
     trimap: TrimapConfig = field(default_factory=TrimapConfig)
     vitmatte: ViTMatteConfig = field(default_factory=ViTMatteConfig)
+
+    # Depth normalization (applied to raw depth from depth stage)
+    depth_norm_percentiles: Tuple[float, float] = (2.0, 98.0)
 
     # Hair detail polish (applied to unknown/edge regions only)
     hair_gamma: float = 0.8           # Closer to 1.0 preserves gradients

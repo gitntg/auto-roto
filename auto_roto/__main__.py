@@ -10,14 +10,18 @@ Usage:
 Commands:
     sam         - SAM3 segmentation
     depth       - Depth estimation
+    vitmatte    - ViTMatte alpha refinement
+    matanyone   - MatAnyone temporal propagation
     pipeline    - Full pipeline (SAM + Depth + ViTMatte + Combine)
-    interactive - Interactive SAM3 → MatAnyone workflow
+    interactive - Interactive SAM3 -> MatAnyone workflow
     version     - Show version
 
 Examples:
     python -m auto_roto sam --input video.mp4 --prompt "person"
     python -m auto_roto depth --input ./frames --output ./output
-    python -m auto_roto pipeline --input video.mp4 --prompt "person" --quality high
+    python -m auto_roto vitmatte --input frame.jpg --mask mask.exr --depth depth.exr
+    python -m auto_roto matanyone --input ./frames --mask mask.exr
+    python -m auto_roto pipeline --input video.mp4 --prompt "person" --preset cinema
     python -m auto_roto interactive --input video.mp4 --prompt "person"
 """
 
@@ -35,13 +39,17 @@ def main():
 Commands:
   sam          SAM3 segmentation
   depth        Depth estimation
-  pipeline     Full pipeline (SAM + Depth + ViTMatte + Combine)
-  interactive  Interactive SAM3 → MatAnyone (recommended for video)
+  vitmatte     ViTMatte alpha refinement
+  matanyone    MatAnyone temporal propagation
+  pipeline     Full pipeline (with --preset cinema/quick)
+  interactive  Interactive SAM3 -> MatAnyone (recommended for video)
   version      Show version
 
 Examples:
+  python -m auto_roto pipeline --input video.mp4 --prompt "person" --preset cinema
   python -m auto_roto sam --input video.mp4 --prompt "person"
-  python -m auto_roto pipeline --input video.mp4 --prompt "person" --quality high
+  python -m auto_roto vitmatte --input frame.jpg --mask mask.exr --depth depth.exr
+  python -m auto_roto matanyone --input ./frames --mask mask.exr
   python -m auto_roto interactive --input video.mp4 --prompt "person"
 
 For command-specific help:
@@ -52,7 +60,7 @@ For command-specific help:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["sam", "depth", "pipeline", "interactive", "version"],
+        choices=["sam", "depth", "vitmatte", "matanyone", "pipeline", "interactive", "version"],
         help="Command to run"
     )
 
@@ -79,6 +87,18 @@ For command-specific help:
         sys.argv = [sys.argv[0]] + remaining
         from auto_roto.cli.depth import main as depth_main
         depth_main()
+
+    elif args.command == "vitmatte":
+        # Pass remaining args to ViTMatte CLI
+        sys.argv = [sys.argv[0]] + remaining
+        from auto_roto.cli.vitmatte import main as vitmatte_main
+        vitmatte_main()
+
+    elif args.command == "matanyone":
+        # Pass remaining args to MatAnyone CLI
+        sys.argv = [sys.argv[0]] + remaining
+        from auto_roto.cli.matanyone import main as matanyone_main
+        matanyone_main()
 
     elif args.command == "pipeline":
         # Pass remaining args to pipeline CLI

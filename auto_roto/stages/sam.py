@@ -41,6 +41,7 @@ class SAMStage(PipelineStage):
         box: str = None,
         points: List[tuple] = None,
         point_labels: List[int] = None,
+        first_frame_only: bool = False,
         logger: logging.Logger = None
     ):
         """
@@ -52,6 +53,7 @@ class SAMStage(PipelineStage):
             box: Box prompt as "x1,y1,x2,y2"
             points: Point coordinates [(x1,y1), (x2,y2), ...]
             point_labels: Point labels (1=include, 0=exclude)
+            first_frame_only: If True, only process the first frame (for MatAnyone mode)
             logger: Optional logger instance
         """
         super().__init__(logger)
@@ -60,6 +62,7 @@ class SAMStage(PipelineStage):
         self.box = box
         self.points = points
         self.point_labels = point_labels
+        self.first_frame_only = first_frame_only
 
     @property
     def name(self) -> str:
@@ -122,6 +125,9 @@ class SAMStage(PipelineStage):
             input_path = context.input_path
             frame_count = 0
 
+            if self.first_frame_only:
+                self._logger.info("First frame only mode (for MatAnyone)")
+
             # Determine segmentation mode
             if self.points and self.point_labels:
                 # Point-based segmentation
@@ -134,6 +140,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
                 else:
                     for idx, mask in sam3.segment_video_with_points(
                         str(input_path), self.points, self.point_labels
@@ -141,6 +149,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
 
             elif self.box:
                 # Box-based segmentation
@@ -154,6 +164,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
                 else:
                     for idx, mask in sam3.segment_video_with_box(
                         str(input_path), box_coords
@@ -161,6 +173,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
 
             else:
                 # Text-based segmentation (default)
@@ -173,6 +187,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
 
                 elif input_path.is_dir():
                     for idx, mask in sam3.segment_frames_with_text(
@@ -181,6 +197,8 @@ class SAMStage(PipelineStage):
                         if mask is not None:
                             writer.write_alpha(mask, idx)
                             frame_count = idx + 1
+                        if self.first_frame_only:
+                            break
 
             self._logger.info(f"Processed {frame_count} frames")
 

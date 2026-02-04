@@ -14,16 +14,16 @@ logger = logging.getLogger("AutoRoto.IO.Alpha")
 
 
 def save_alpha(
-    alpha: np.ndarray,
     filepath: Union[str, Path],
+    alpha: np.ndarray,
     bit_depth: int = 16
 ) -> None:
     """
     Save alpha matte to file.
 
     Args:
-        alpha: Alpha matte (H, W), values 0-1
         filepath: Output path (format determined by extension)
+        alpha: Alpha matte (H, W), values 0-1
         bit_depth: Output bit depth (8, 16, or 32)
     """
     import cv2

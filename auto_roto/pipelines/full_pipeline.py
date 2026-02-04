@@ -16,10 +16,12 @@ from typing import Dict, Any, List, Optional
 from auto_roto.stages.base import StageContext, StageResult, StageStatus
 from auto_roto.stages.sam import SAMStage
 from auto_roto.stages.depth import DepthStage
+from auto_roto.stages.depth_expand import DepthExpandStage
 from auto_roto.stages.vitmatte import ViTMatteStage
 from auto_roto.stages.combine import CombineStage
+from auto_roto.stages.matanyone import MatAnyoneStage
 from auto_roto.config.pipeline import PipelineConfig
-from auto_roto.config.presets import get_quality_preset
+from auto_roto.config.presets import get_quality_preset, get_pipeline_preset
 from auto_roto.utils.gpu import clear_gpu_memory
 
 logger = logging.getLogger("AutoRoto.Pipelines.Full")
@@ -86,6 +88,11 @@ class FullPipeline:
 
     def _apply_quality_preset(self):
         """Apply quality preset settings to config."""
+        # Apply pipeline preset first if specified (overrides quality preset)
+        if self.config.preset:
+            self._apply_pipeline_preset()
+            return
+
         preset = get_quality_preset(self.config.quality)
 
         # Apply depth model if not set
@@ -113,6 +120,22 @@ class FullPipeline:
             self.config.guided_filter_radius = preset.get('guided_filter_radius', 4)
         if self.config.guided_filter_eps is None:
             self.config.guided_filter_eps = preset.get('guided_filter_eps', 1e-5)
+
+    def _apply_pipeline_preset(self):
+        """Apply pipeline preset settings to config."""
+        preset_config = get_pipeline_preset(self.config.preset)
+        if not preset_config:
+            self._logger.warning(f"Unknown preset: {self.config.preset}")
+            return
+
+        self._logger.info(f"Applying pipeline preset: {preset_config.get('name', self.config.preset)}")
+
+        settings = preset_config.get('settings', {})
+
+        # Apply all settings from preset
+        for key, value in settings.items():
+            if hasattr(self.config, key):
+                setattr(self.config, key, value)
 
     def run(
         self,
@@ -181,6 +204,13 @@ class FullPipeline:
         # Track results
         results: Dict[str, StageResult] = {}
 
+        # Determine if we're in MatAnyone temporal mode
+        use_matanyone = self.config.use_matanyone
+        first_frame_only = use_matanyone
+
+        if use_matanyone:
+            self._logger.info("MatAnyone mode: Processing only frame 1 for refinement stages")
+
         # =================================================================
         # STAGE 1: SAM Segmentation
         # =================================================================
@@ -197,6 +227,7 @@ class FullPipeline:
                 config=sam_config,
                 prompts=prompts,
                 box=self.config.box if self.config.box else None,
+                first_frame_only=first_frame_only,
                 logger=self._logger
             )
 
@@ -234,6 +265,7 @@ class FullPipeline:
 
             depth_stage = DepthStage(
                 config=depth_config,
+                first_frame_only=first_frame_only,
                 logger=self._logger
             )
 
@@ -246,6 +278,37 @@ class FullPipeline:
             clear_gpu_memory()
         else:
             self._logger.info("Skipping depth stage (--skip-depth)")
+
+        # =================================================================
+        # STAGE 2b: Depth-Guided Mask Expansion (optional - cinema preset)
+        # =================================================================
+        if self.config.depth_expansion_enabled and "depth" in results and results["depth"].success:
+            from auto_roto.config.depth_expansion import DepthExpansionConfig
+
+            expansion_config = DepthExpansionConfig(
+                enabled=True,
+                depth_tolerance=self.config.depth_expansion_tolerance,
+                percentile_range=self.config.depth_expansion_percentiles,
+                require_connectivity=self.config.depth_expansion_connectivity,
+                max_expansion_px=self.config.depth_expansion_max_px,
+                edge_aware=self.config.depth_expansion_edge_aware,
+            )
+
+            depth_expand_stage = DepthExpandStage(
+                config=expansion_config,
+                first_frame_only=first_frame_only,
+                logger=self._logger
+            )
+
+            result = depth_expand_stage.execute(context)
+            results["depth_expand"] = result
+
+            if result.failed:
+                self._logger.warning("Depth expansion failed, continuing with SAM output")
+            else:
+                self._logger.info("Depth expansion complete - expanded masks will be used")
+
+            clear_gpu_memory()
 
         # =================================================================
         # STAGE 3: ViTMatte Refinement
@@ -276,6 +339,7 @@ class FullPipeline:
             vitmatte_stage = ViTMatteStage(
                 config=geometric_config,
                 save_trimap=True,
+                first_frame_only=first_frame_only,
                 logger=self._logger
             )
 
@@ -305,6 +369,7 @@ class FullPipeline:
 
             combine_stage = CombineStage(
                 config=combine_config,
+                first_frame_only=first_frame_only,
                 logger=self._logger
             )
 
@@ -315,6 +380,33 @@ class FullPipeline:
                 self._logger.warning("Combine stage failed")
         else:
             self._logger.info("Skipping combine stage (--skip-combine)")
+
+        # =================================================================
+        # STAGE 5: MatAnyone Temporal Propagation (optional)
+        # =================================================================
+        if use_matanyone:
+            matanyone_stage = MatAnyoneStage(
+                repo_path=self.config.mam2_repo,
+                checkpoint_path=self.config.mam2_checkpoint,
+                mem_every=self.config.matanyone_mem_every,
+                max_mem_frames=self.config.matanyone_max_mem_frames,
+                warmup=self.config.matanyone_warmup,
+                erode=self.config.matanyone_erode,
+                dilate=self.config.matanyone_dilate,
+                top_k=self.config.matanyone_top_k,
+                use_long_term=self.config.matanyone_use_long_term,
+                max_internal_size=self.config.matanyone_max_internal_size,
+                logger=self._logger
+            )
+
+            result = matanyone_stage.execute(context)
+            results["matanyone"] = result
+
+            if result.failed:
+                self._logger.error("MatAnyone stage failed")
+                # Don't return False - still have combine output as fallback
+
+            clear_gpu_memory()
 
         # =================================================================
         # FINALIZE
@@ -416,10 +508,12 @@ class FullPipeline:
         final_output.mkdir(parents=True, exist_ok=True)
 
         # Determine source - use the last successful stage
+        # MatAnyone takes priority when available since it has all frames
         source = None
-        for stage_name in ["combine", "vitmatte", "sam"]:
+        for stage_name in ["matanyone", "combine", "vitmatte", "sam"]:
             if stage_name in results and results[stage_name].success:
                 source = results[stage_name].output_dir
+                self._logger.info(f"Using output from: {stage_name}")
                 break
 
         if not source:
@@ -454,8 +548,10 @@ class FullPipeline:
             "00_frames",
             "01_sam_output",
             "02_depth_output",
+            "02b_depth_expand_output",
             "03_vitmatte_output",
-            "04_combine_output"
+            "04_combine_output",
+            "05_matanyone_output"
         ]
 
         for dirname in intermediate_dirs:

@@ -173,8 +173,9 @@ def load_matanyone_v1_adapter(
         model = MatAnyone(cfg, single_object=True).to(device).eval()
         model_weights = torch.load(str(checkpoint_path), map_location=device)
     else:
-        model = MatAnyone(cfg, single_object=True).cuda().eval()
-        model_weights = torch.load(str(checkpoint_path))
+        # CPU path: load model on CPU, map weights to CPU
+        model = MatAnyone(cfg, single_object=True).cpu().eval()
+        model_weights = torch.load(str(checkpoint_path), map_location="cpu")
 
     model.load_weights(model_weights)
     log.info("✓ Loaded MatAnyone from local checkpoint")
@@ -395,30 +396,41 @@ def process_matanyone_v1_sequence(
     first_frame = frames[0]
     h, w = first_frame.shape[:2]
 
-    # Convert to tensor format expected by MatAnyone
-    frame_tensor = torch.from_numpy(first_frame).permute(2, 0, 1).unsqueeze(0).to(device)
-    frame_tensor = frame_tensor / 255.0 if frame_tensor.max() > 1.0 else frame_tensor
-    mask_tensor = torch.from_numpy(mask_uint8).unsqueeze(0).unsqueeze(0).float().to(device)
-    mask_tensor = mask_tensor / 255.0
-
-    processor.set_all_labels(list(range(1, 2)))  # Single object
-    processor.step(frame_tensor, mask_tensor, idx_mask=False)
-
     # Process remaining frames
     from auto_roto.io.alpha import save_alpha
 
+    # Object IDs for single object matting
+    objects = [1]
+
+    # Prepare mask tensor (2D: H, W)
+    mask_tensor = torch.from_numpy(mask_uint8).float().to(device)
+    mask_tensor = mask_tensor / 255.0 if mask_tensor.max() > 1.0 else mask_tensor
+
+    log.info(f"Processing {len(frames)} frames with {warmup} warmup frames")
+
     for idx, frame in enumerate(frames):
-        if idx > 0:
-            frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).unsqueeze(0).to(device)
-            frame_tensor = frame_tensor / 255.0 if frame_tensor.max() > 1.0 else frame_tensor
+        # Convert frame to tensor: (3, H, W) normalized to [0, 1]
+        frame_tensor = torch.from_numpy(frame).permute(2, 0, 1).to(device)
+        frame_tensor = frame_tensor / 255.0 if frame_tensor.max() > 1.0 else frame_tensor
 
-            with safe_autocast():
-                out_mask = processor.step(frame_tensor)
+        with safe_autocast():
+            if idx == 0:
+                # First frame: encode mask into memory
+                processor.step(frame_tensor, mask_tensor, objects=objects)
+                # Get first frame prediction
+                out_prob = processor.step(frame_tensor, first_frame_pred=True)
+            elif idx <= warmup:
+                # Warmup frames: reinitialize as first frame prediction
+                out_prob = processor.step(frame_tensor, first_frame_pred=True)
+            else:
+                # Normal propagation
+                out_prob = processor.step(frame_tensor)
 
-            alpha = out_mask[0, 0].cpu().numpy()
-        else:
-            alpha = mask_np
+            # Convert output probability to mask using MatAnyone's method
+            alpha_mask = processor.output_prob_to_mask(out_prob)
 
+        # Convert to numpy
+        alpha = alpha_mask.detach().cpu().numpy()
         alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32)
 
         # Save output
@@ -428,7 +440,7 @@ def process_matanyone_v1_sequence(
         else:
             out_path = alpha_output_dir / f"{frame_name}.{output_format}"
 
-        save_alpha(alpha, out_path, bit_depth=bit_depth)
+        save_alpha(out_path, alpha, bit_depth=bit_depth)
 
         if (idx + 1) % 10 == 0:
             log.info(f"Processed frame {idx + 1}/{len(frames)}")

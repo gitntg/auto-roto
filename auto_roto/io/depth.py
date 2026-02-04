@@ -15,15 +15,15 @@ logger = logging.getLogger("AutoRoto.IO.Depth")
 
 
 def save_depth_float(
-    depth: np.ndarray,
-    filepath: Union[str, Path]
+    filepath: Union[str, Path],
+    depth: np.ndarray
 ) -> None:
     """
     Save depth map as float EXR (single Y channel) for proper precision.
 
     Args:
-        depth: Depth map (H, W), float32
         filepath: Output path
+        depth: Depth map (H, W), float32
     """
     filepath = Path(filepath)
 

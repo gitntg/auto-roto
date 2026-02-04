@@ -1,13 +1,21 @@
 """
-Interactive SAM3 → MatAnyone Pipeline
-======================================
+Interactive Rotoscoping Pipeline
+================================
 
-Interactive workflow for high-quality video matting:
-1. SAM3 segments first frame with text prompt
-2. User reviews and refines with include/exclude points
-3. MatAnyone processes entire video with approved mask
+Interactive workflow for high-quality video matting with two modes:
 
-MatAnyone uses Consistent Memory Propagation - only needs first-frame mask.
+Standard Mode:
+  1. SAM3 segments first frame with text prompt
+  2. User reviews and refines mask
+  3. MatAnyone processes entire video
+
+Cinema Mode:
+  1. SAM3 segments first frame with text prompt
+  2. User reviews and refines mask
+  3. Depth Anything 3 estimates depth
+  4. Depth expansion captures same-depth pixels
+  5. ViTMatte refines alpha with trimap
+  6. MatAnyone processes entire video with refined mask
 """
 
 import logging
@@ -17,7 +25,7 @@ import tempfile
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
@@ -56,6 +64,8 @@ class InteractiveMatAnyonePipeline:
         bit_depth: int = 16,
         matanyone_repo: str = "./MatAnyone",
         matanyone_checkpoint: str = "./checkpoints/matanyone.pth",
+        use_cinema_preset: bool = False,
+        cinema_settings: Dict[str, Any] = None,
         logger: logging.Logger = None
     ):
         """
@@ -71,6 +81,8 @@ class InteractiveMatAnyonePipeline:
             bit_depth: Bit depth for output
             matanyone_repo: Path to MatAnyone repository
             matanyone_checkpoint: Path to MatAnyone checkpoint
+            use_cinema_preset: Enable cinema preset (depth + expansion + ViTMatte)
+            cinema_settings: Cinema-specific settings dict
             logger: Optional logger instance
         """
         self.prompt = prompt
@@ -82,6 +94,13 @@ class InteractiveMatAnyonePipeline:
         self.bit_depth = bit_depth
         self.matanyone_repo = Path(matanyone_repo)
         self.matanyone_checkpoint = Path(matanyone_checkpoint)
+        self.use_cinema_preset = use_cinema_preset
+        self.cinema_settings = cinema_settings or {
+            'depth_model': 'large',
+            'depth_expand_enabled': True,
+            'depth_expand_tolerance': 0.1,
+            'vitmatte_enabled': True,
+        }
         self._logger = logger or logging.getLogger("InteractiveMatAnyone")
 
     def run(
@@ -124,7 +143,11 @@ class InteractiveMatAnyonePipeline:
             output_path.mkdir(parents=True, exist_ok=True)
 
             self._logger.info("=" * 60)
-            self._logger.info("INTERACTIVE SAM3 → MATANYONE PIPELINE")
+            if self.use_cinema_preset:
+                self._logger.info("INTERACTIVE CINEMA PIPELINE")
+                self._logger.info("(SAM3 -> Depth -> Expand -> ViTMatte -> MatAnyone)")
+            else:
+                self._logger.info("INTERACTIVE SAM3 -> MATANYONE PIPELINE")
             self._logger.info("=" * 60)
             self._logger.info(f"Input: {input_path}")
             self._logger.info(f"Output: {output_dir}")
@@ -173,12 +196,27 @@ class InteractiveMatAnyonePipeline:
             cv2.imwrite(str(mask_path), (approved_mask * 255).astype(np.uint8))
             self._logger.info(f"  Approved mask saved: {mask_path}")
 
-            # =====================================================================
-            # STEP 3: Run MatAnyone
-            # =====================================================================
-            self._logger.info("\n[Step 3] Running MatAnyone...")
+            # The mask to pass to MatAnyone (may be refined by cinema steps)
+            final_mask_path = mask_path
 
-            success = self._run_matanyone(input_path, mask_path, output_path)
+            # =====================================================================
+            # CINEMA PRESET STEPS (optional)
+            # =====================================================================
+            if self.use_cinema_preset:
+                final_mask_path = self._run_cinema_refinement(
+                    first_frame, approved_mask, output_path
+                )
+                if final_mask_path is None:
+                    self._logger.warning("Cinema refinement failed, using SAM mask")
+                    final_mask_path = mask_path
+
+            # =====================================================================
+            # FINAL STEP: Run MatAnyone
+            # =====================================================================
+            step_num = 6 if self.use_cinema_preset else 3
+            self._logger.info(f"\n[Step {step_num}] Running MatAnyone...")
+
+            success = self._run_matanyone(input_path, final_mask_path, output_path)
 
             # Summary
             total_time = time.time() - start_time
@@ -389,6 +427,178 @@ class InteractiveMatAnyonePipeline:
         filled = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, kernel)
 
         return filled.astype(np.float32)
+
+    def _run_cinema_refinement(
+        self,
+        first_frame: np.ndarray,
+        sam_mask: np.ndarray,
+        output_path: Path
+    ) -> Optional[Path]:
+        """
+        Run cinema preset refinement steps on first frame.
+
+        Steps:
+            3. Depth Anything 3 estimates depth
+            4. Depth expansion captures same-depth pixels
+            5. ViTMatte refines alpha with trimap
+
+        Returns:
+            Path to refined mask, or None if failed
+        """
+        import cv2
+
+        from auto_roto.utils.gpu import clear_gpu_memory
+
+        cinema_dir = output_path / "cinema_refinement"
+        cinema_dir.mkdir(exist_ok=True)
+
+        current_mask = sam_mask.copy()
+        depth_map = None
+
+        # =====================================================================
+        # STEP 3: Depth Estimation
+        # =====================================================================
+        self._logger.info("\n[Step 3] Running Depth Anything 3...")
+
+        try:
+            from auto_roto.models.depth_anything import DepthEstimator
+
+            depth_model = self.cinema_settings.get('depth_model', 'large')
+            self._logger.info(f"  Model: {depth_model}")
+
+            estimator = DepthEstimator(
+                model_size=depth_model,
+                device=self.device,
+                logger=self._logger
+            )
+
+            depth_map = estimator.estimate(first_frame)
+
+            # Save depth for debugging
+            depth_path = cinema_dir / "depth.exr"
+            from auto_roto.io.depth import save_depth_float
+            save_depth_float(depth_path, depth_map)
+            self._logger.info(f"  Depth saved: {depth_path}")
+
+            estimator.release()
+            clear_gpu_memory()
+
+        except Exception as e:
+            self._logger.error(f"  Depth estimation failed: {e}")
+            return None
+
+        # =====================================================================
+        # STEP 4: Depth Expansion
+        # =====================================================================
+        if self.cinema_settings.get('depth_expand_enabled', True) and depth_map is not None:
+            self._logger.info("\n[Step 4] Running depth-guided expansion...")
+
+            try:
+                from auto_roto.config.depth_expansion import DepthExpansionConfig
+                from auto_roto.refiners.depth_expansion import DepthBasedExpander
+
+                expansion_config = DepthExpansionConfig(
+                    enabled=True,
+                    depth_tolerance=self.cinema_settings.get('depth_expand_tolerance', 0.1),
+                    percentile_range=(10, 90),
+                    require_connectivity=True,
+                    max_expansion_px=50,
+                    edge_aware=True,
+                )
+
+                expander = DepthBasedExpander(expansion_config, self._logger)
+                expanded_mask = expander.expand_mask(current_mask, depth_map, first_frame)
+
+                # Show expansion results
+                original_pixels = np.sum(current_mask > 0.5)
+                expanded_pixels = np.sum(expanded_mask > 0.5)
+                self._logger.info(
+                    f"  Expanded: {original_pixels} -> {expanded_pixels} pixels "
+                    f"({expanded_pixels / max(1, original_pixels) * 100:.1f}%)"
+                )
+
+                current_mask = expanded_mask
+
+                # Save expanded mask
+                expanded_path = cinema_dir / "expanded_mask.png"
+                cv2.imwrite(str(expanded_path), (current_mask * 255).astype(np.uint8))
+
+            except Exception as e:
+                self._logger.warning(f"  Depth expansion failed: {e}")
+                self._logger.info("  Continuing with SAM mask")
+
+        else:
+            self._logger.info("\n[Step 4] Skipping depth expansion (disabled)")
+
+        # =====================================================================
+        # STEP 5: ViTMatte Refinement
+        # =====================================================================
+        if self.cinema_settings.get('vitmatte_enabled', True) and depth_map is not None:
+            self._logger.info("\n[Step 5] Running ViTMatte refinement...")
+
+            try:
+                from auto_roto.config.vitmatte import GeometricMatteConfig, TrimapConfig, ViTMatteConfig
+                from auto_roto.refiners.geometric import GeometricMatteRefiner
+
+                trimap_config = TrimapConfig(
+                    adaptive_mode=True,
+                    adaptive_base_px=2.0,
+                    adaptive_max_px=60.0,
+                )
+
+                vitmatte_config = ViTMatteConfig(
+                    model_size="base",
+                    device=self.device,
+                )
+
+                geometric_config = GeometricMatteConfig(
+                    trimap=trimap_config,
+                    vitmatte=vitmatte_config,
+                    hair_gamma=0.9,
+                    hair_black_point=0.01,
+                    hair_gain=1.05,
+                    hair_polish_enabled=True,
+                    guided_filter_radius=2,
+                    guided_filter_eps=1e-5,
+                )
+
+                refiner = GeometricMatteRefiner(geometric_config, self._logger)
+
+                # Save trimap for debugging
+                trimap_path = cinema_dir / "trimap.png"
+
+                refined_alpha = refiner.process_frame(
+                    rgb=first_frame,
+                    sam_mask=current_mask,
+                    depth=depth_map,
+                    save_trimap_path=trimap_path
+                )
+
+                current_mask = refined_alpha
+                self._logger.info("  ViTMatte refinement complete")
+
+                refiner.release()
+                clear_gpu_memory()
+
+            except Exception as e:
+                self._logger.warning(f"  ViTMatte refinement failed: {e}")
+                self._logger.info("  Continuing with expanded mask")
+
+        else:
+            self._logger.info("\n[Step 5] Skipping ViTMatte (disabled)")
+
+        # Save final refined mask
+        refined_mask_path = cinema_dir / "refined_mask.png"
+        cv2.imwrite(str(refined_mask_path), (current_mask * 255).astype(np.uint8))
+        self._logger.info(f"  Refined mask saved: {refined_mask_path}")
+
+        # Show preview of refined mask
+        preview = self._create_preview(first_frame, current_mask)
+        preview_path = cinema_dir / "preview_refined.png"
+        cv2.imwrite(str(preview_path), cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
+        self._open_preview(preview_path)
+
+        return refined_mask_path
 
     def _create_preview(
         self,

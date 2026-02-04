@@ -41,11 +41,16 @@ class GeometricMatteRefiner:
         self.config = config or GeometricMatteConfig()
         self.logger = logger or logging.getLogger("GeometricMatte")
 
+        # Initialize to None for safe cleanup if init fails
+        self.trimap_synth = None
+        self.vitmatte = None
+
         self.trimap_synth = TrimapSynthesizer(self.config.trimap, self.logger)
         self.vitmatte = ViTMatteRefiner(
             model_size=self.config.vitmatte.model_size,
             device=self.config.vitmatte.device,
             max_resolution=self.config.vitmatte.max_resolution,
+            use_fp16=getattr(self.config.vitmatte, 'use_fp16', True),
             logger=self.logger
         )
 
@@ -79,9 +84,10 @@ class GeometricMatteRefiner:
             curr_frame_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
             prev_frame_gray = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2GRAY)
 
-        # Normalize depth
+        # Normalize depth using configured percentiles
         depth = depth.astype(np.float32)
-        p_low, p_high = np.percentile(depth, [2.0, 98.0])
+        percentiles = self.config.depth_norm_percentiles
+        p_low, p_high = np.percentile(depth, list(percentiles))
         depth = np.clip((depth - p_low) / (p_high - p_low + 1e-8), 0, 1)
         depth = 1.0 - depth
 
@@ -151,7 +157,8 @@ class GeometricMatteRefiner:
 
     def release(self):
         """Release GPU memory."""
-        self.vitmatte.release()
+        if self.vitmatte is not None:
+            self.vitmatte.release()
 
     def __del__(self):
         """Destructor to ensure cleanup."""

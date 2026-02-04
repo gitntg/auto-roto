@@ -37,7 +37,8 @@ class ViTMatteRefiner:
         self,
         model_size: str = "base",
         device: str = "cuda",
-        max_resolution: int = 8192,
+        max_resolution: int = 2048,
+        use_fp16: bool = True,
         logger: logging.Logger = None
     ):
         """
@@ -47,11 +48,13 @@ class ViTMatteRefiner:
             model_size: Model size ("small" or "base")
             device: Compute device (cuda, cpu)
             max_resolution: Maximum dimension for processing
+            use_fp16: Use half precision for lower VRAM usage
             logger: Optional logger instance
         """
         self.model_size = model_size
         self.device = device
         self.max_resolution = max_resolution
+        self.use_fp16 = use_fp16 and device == "cuda"
         self.logger = logger or logging.getLogger("ViTMatte")
 
         self.model = None
@@ -65,10 +68,19 @@ class ViTMatteRefiner:
 
         model_id = self.MODEL_IDS.get(self.model_size, self.MODEL_IDS['base'])
 
-        self.logger.info(f"Loading ViTMatte ({self.model_size}) from {model_id}...")
+        precision = "fp16" if self.use_fp16 else "fp32"
+        self.logger.info(f"Loading ViTMatte ({self.model_size}, {precision}) from {model_id}...")
 
         self.processor = VitMatteImageProcessor.from_pretrained(model_id)
-        self.model = VitMatteForImageMatting.from_pretrained(model_id)
+
+        if self.use_fp16:
+            self.model = VitMatteForImageMatting.from_pretrained(
+                model_id,
+                torch_dtype=torch.float16
+            )
+        else:
+            self.model = VitMatteForImageMatting.from_pretrained(model_id)
+
         self.model = self.model.to(self.device).eval()
 
         self.logger.info("ViTMatte loaded successfully")
@@ -137,7 +149,11 @@ class ViTMatteRefiner:
             return_tensors="pt"
         )
 
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Move to device with appropriate dtype
+        if self.use_fp16:
+            inputs = {k: v.to(self.device, dtype=torch.float16) if v.dtype == torch.float32 else v.to(self.device) for k, v in inputs.items()}
+        else:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         # Run inference
         with torch.no_grad():
@@ -154,7 +170,7 @@ class ViTMatteRefiner:
                 align_corners=False
             )
 
-        alpha = alpha.squeeze().cpu().numpy()
+        alpha = alpha.squeeze().cpu().float().numpy()  # Ensure float32 for OpenCV
 
         # Upscale back to original resolution
         if scale_factor < 1.0:
@@ -209,5 +225,6 @@ def create_vitmatte_refiner(config=None, **kwargs) -> ViTMatteRefiner:
             model_size=kwargs.get('model_size', config.model_size),
             device=kwargs.get('device', config.device),
             max_resolution=kwargs.get('max_resolution', config.max_resolution),
+            use_fp16=kwargs.get('use_fp16', getattr(config, 'use_fp16', True)),
         )
     return ViTMatteRefiner(**kwargs)

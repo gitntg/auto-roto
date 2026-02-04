@@ -8,6 +8,7 @@ Uses depth-guided trimap generation for high-quality alpha matting.
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -41,6 +42,7 @@ class ViTMatteStage(PipelineStage):
         self,
         config: GeometricMatteConfig = None,
         save_trimap: bool = True,
+        first_frame_only: bool = False,
         logger: logging.Logger = None
     ):
         """
@@ -49,11 +51,13 @@ class ViTMatteStage(PipelineStage):
         Args:
             config: GeometricMatteConfig instance (uses defaults if None)
             save_trimap: Whether to save trimap visualizations
+            first_frame_only: If True, only process the first frame (for MatAnyone mode)
             logger: Optional logger instance
         """
         super().__init__(logger)
         self.config = config or GeometricMatteConfig()
         self.save_trimap = save_trimap
+        self.first_frame_only = first_frame_only
 
     @property
     def name(self) -> str:
@@ -65,14 +69,13 @@ class ViTMatteStage(PipelineStage):
 
     def validate_inputs(self, context: StageContext) -> Optional[str]:
         """Validate that SAM masks and depth maps exist."""
-        # Check for SAM output
-        sam_result = context.get_stage_output("sam")
-        if not sam_result or not sam_result.success:
-            return "SAM stage must complete successfully first"
-
-        alpha_dir = context.get_alpha_dir("sam")
+        # Check for input masks - prefer depth_expand, fall back to sam
+        alpha_dir = context.get_alpha_dir("depth_expand")
         if not alpha_dir or not alpha_dir.exists():
-            return f"SAM alpha output not found"
+            alpha_dir = context.get_alpha_dir("sam")
+
+        if not alpha_dir or not alpha_dir.exists():
+            return "No input masks found (need sam or depth_expand output)"
 
         # Check for depth output
         depth_result = context.get_stage_output("depth")
@@ -110,8 +113,14 @@ class ViTMatteStage(PipelineStage):
             trimap_dir = output_dir / "trimap"
             trimap_dir.mkdir(exist_ok=True)
 
-        # Get input directories
-        sam_alpha_dir = context.get_alpha_dir("sam")
+        # Get input directories - prefer depth_expand masks when available
+        input_alpha_dir = context.get_alpha_dir("depth_expand")
+        if not input_alpha_dir or not input_alpha_dir.exists():
+            input_alpha_dir = context.get_alpha_dir("sam")
+            self._logger.info("Using SAM masks as input")
+        else:
+            self._logger.info("Using depth-expanded masks as input")
+
         depth_dir = context.get_depth_dir("depth")
         frames_dir = context.frames_dir or context.input_path
 
@@ -126,68 +135,80 @@ class ViTMatteStage(PipelineStage):
         )
 
         try:
-            # Get frame files
-            frame_files = sorted(
-                list(frames_dir.glob("*.png")) +
-                list(frames_dir.glob("*.jpg")) +
-                list(frames_dir.glob("*.jpeg"))
+            # Build frame index -> file mappings for proper alignment
+            # This handles cases where depth_expand may have skipped frames
+            frame_files_by_idx = self._build_file_index_map(
+                frames_dir, ["*.png", "*.jpg", "*.jpeg"]
+            )
+            mask_files_by_idx = self._build_file_index_map(
+                input_alpha_dir, ["*.exr", "*.png"]
+            )
+            depth_files_by_idx = self._build_file_index_map(
+                depth_dir, ["*.exr"]
             )
 
-            # Get SAM mask files
-            sam_files = sorted(
-                list(sam_alpha_dir.glob("*.exr")) +
-                list(sam_alpha_dir.glob("*.png"))
-            )
-
-            # Get depth files
-            depth_files = sorted(depth_dir.glob("*.exr"))
-
-            if not frame_files or not sam_files or not depth_files:
+            if not frame_files_by_idx or not mask_files_by_idx or not depth_files_by_idx:
                 return StageResult.failure_result(
                     ValueError("Missing input files"),
-                    message="No frame, SAM, or depth files found"
+                    message="No frame, mask, or depth files found"
                 )
 
-            # Ensure counts match
-            min_count = min(len(frame_files), len(sam_files), len(depth_files))
-            self._logger.info(f"Processing {min_count} frames")
+            # Find common frame indices across all inputs
+            common_indices = sorted(
+                set(frame_files_by_idx.keys()) &
+                set(mask_files_by_idx.keys()) &
+                set(depth_files_by_idx.keys())
+            )
+
+            if not common_indices:
+                return StageResult.failure_result(
+                    ValueError("No matching frames"),
+                    message="No frame indices match across frames, masks, and depth files"
+                )
+
+            if self.first_frame_only:
+                common_indices = common_indices[:1]
+                self._logger.info("First frame only mode (for MatAnyone)")
+
+            self._logger.info(f"Processing {len(common_indices)} frames with matching indices")
 
             prev_rgb = None
             frame_count = 0
 
-            for idx in range(min_count):
-                # Load inputs
-                frame = cv2.imread(str(frame_files[idx]))
+            for frame_idx in common_indices:
+                # Load inputs using frame index (not list index)
+                frame = cv2.imread(str(frame_files_by_idx[frame_idx]))
                 if frame is None:
+                    self._logger.warning(f"Could not read frame {frame_idx}, skipping")
                     continue
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                sam_mask = load_alpha(sam_files[idx])
-                depth = load_depth_float(depth_files[idx])
+                input_mask = load_alpha(mask_files_by_idx[frame_idx])
+                depth = load_depth_float(depth_files_by_idx[frame_idx])
 
-                # Set trimap save path
+                # Set trimap save path (use frame_idx for proper alignment)
                 trimap_path = None
                 if trimap_dir:
-                    trimap_path = trimap_dir / f"trimap.{idx:04d}.png"
+                    trimap_path = trimap_dir / f"trimap.{frame_idx:04d}.png"
 
                 # Process frame
                 alpha = refiner.process_frame(
                     rgb=rgb,
-                    sam_mask=sam_mask,
+                    sam_mask=input_mask,
                     depth=depth,
                     save_trimap_path=trimap_path,
                     prev_rgb=prev_rgb
                 )
 
-                # Save alpha
-                alpha_path = alpha_out_dir / f"alpha.{idx:04d}.{output_format}"
+                # Save alpha (use frame_idx for proper alignment with inputs)
+                alpha_path = alpha_out_dir / f"alpha.{frame_idx:04d}.{output_format}"
                 save_alpha(alpha_path, alpha, bit_depth=bit_depth)
 
                 prev_rgb = rgb
-                frame_count = idx + 1
+                frame_count += 1
 
-                if idx % 10 == 0:
-                    self._logger.info(f"  Frame {idx}/{min_count}")
+                if frame_count % 10 == 0:
+                    self._logger.info(f"  Frame {frame_idx} ({frame_count}/{len(common_indices)})")
 
             self._logger.info(f"Refined {frame_count} frames")
 
@@ -206,6 +227,35 @@ class ViTMatteStage(PipelineStage):
 
         finally:
             refiner.release()
+
+    def _build_file_index_map(self, directory: Path, patterns: list) -> dict:
+        """
+        Build a mapping of frame indices to file paths.
+
+        Extracts numeric frame indices from filenames and maps them to paths.
+        This enables frame-index-based matching instead of list-index pairing.
+
+        Args:
+            directory: Directory to search
+            patterns: List of glob patterns (e.g., ["*.png", "*.jpg"])
+
+        Returns:
+            Dict mapping frame_index (int) -> file_path (Path)
+        """
+        file_map = {}
+
+        for pattern in patterns:
+            for filepath in directory.glob(pattern):
+                # Extract frame index from filename
+                # Handles patterns like: frame.0001.png, depth_0001.exr, roto_0001.exr
+                match = re.search(r'(\d+)', filepath.stem)
+                if match:
+                    frame_idx = int(match.group(1))
+                    # Don't overwrite if already found (first pattern wins)
+                    if frame_idx not in file_map:
+                        file_map[frame_idx] = filepath
+
+        return file_map
 
     def cleanup(self, context: StageContext):
         """Clear GPU memory after ViTMatte."""

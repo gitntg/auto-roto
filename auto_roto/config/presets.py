@@ -3,11 +3,88 @@ Quality Presets
 ===============
 
 Predefined quality settings for different use cases.
+
+Contains two preset types:
+    - QUALITY_PRESETS: Per-parameter quality tuning (draft/standard/high/ultra)
+    - PIPELINE_PRESETS: Full workflow configurations (cinema/quick)
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 
+# Pipeline workflow presets - full workflow configurations
+PIPELINE_PRESETS: Dict[str, Dict[str, Any]] = {
+    'cinema': {
+        'name': 'Cinema',
+        'description': 'Maximum quality with depth-guided expansion + temporal propagation',
+        'stages': ['sam', 'depth', 'depth_expand', 'vitmatte', 'combine', 'matanyone'],
+        'settings': {
+            # Depth model: nested-large for best quality
+            'depth_model': 'nested-large',
+            'depth_process_res': 2048,
+            'depth_process_method': 'lower',
+            # use_matanyone=True causes stages to process only first frame,
+            # then MatAnyone propagates temporally to all frames
+            'use_matanyone': True,
+            # Enable depth expansion
+            'depth_expansion_enabled': True,
+            'depth_expansion_tolerance': 0.1,
+            'depth_expansion_percentiles': (5, 95),
+            'depth_expansion_connectivity': True,
+            'depth_expansion_max_px': 100,
+            # Maximum detail preservation
+            'hair_gamma': 1.0,
+            'hair_black_point': 0.0,
+            'hair_gain': 1.0,
+            'guided_filter_radius': 1,
+            'guided_filter_eps': 1e-6,
+        }
+    },
+    'quick': {
+        'name': 'Quick Preview',
+        'description': 'Fast single-frame processing for preview',
+        'stages': ['sam', 'depth', 'vitmatte', 'combine'],
+        'settings': {
+            'depth_model': 'small',
+            'depth_process_res': None,
+            # No temporal propagation - processes all frames individually
+            'use_matanyone': False,
+            'depth_expansion_enabled': False,
+            'hair_gamma': 0.7,
+            'hair_black_point': 0.03,
+            'hair_gain': 1.2,
+            'guided_filter_radius': 4,
+            'guided_filter_eps': 1e-4,
+        }
+    },
+}
+
+
+def get_pipeline_preset(preset_name: str) -> Dict[str, Any]:
+    """
+    Get a pipeline preset configuration.
+
+    Args:
+        preset_name: One of 'cinema', 'quick'
+
+    Returns:
+        Dictionary with preset configuration
+    """
+    return PIPELINE_PRESETS.get(preset_name, {})
+
+
+def list_pipeline_presets() -> List[str]:
+    """Return list of available pipeline preset names."""
+    return list(PIPELINE_PRESETS.keys())
+
+
+def get_pipeline_preset_description(preset_name: str) -> str:
+    """Get human-readable description of a pipeline preset."""
+    preset = PIPELINE_PRESETS.get(preset_name, {})
+    return preset.get('description', 'Unknown preset')
+
+
+# Quality presets - per-parameter quality tuning
 QUALITY_PRESETS: Dict[str, Dict[str, Any]] = {
     'draft': {
         'depth_model': 'small',

@@ -31,19 +31,29 @@ def parse_args():
         description="AUTO-ROTO Full Pipeline - Production-grade automatic rotoscoping",
         epilog="""
 EXAMPLES:
-  # Standard quality
+  # Cinema preset (production quality with depth expansion + temporal)
+  %(prog)s --input video.mp4 --prompt "person" --preset cinema
+
+  # Quick preview
+  %(prog)s --input video.mp4 --prompt "person" --preset quick
+
+  # Standard quality (manual config)
   %(prog)s --input video.mp4 --prompt "person" --output ./output
 
   # High quality with hair refinement
   %(prog)s --input video.mp4 --prompt "person" --quality high --with-hair
 
-  # Ultra quality
-  %(prog)s --input video.mp4 --prompt "person" --quality ultra
+  # MatAnyone temporal mode: refine frame 1, propagate to all frames
+  %(prog)s --input video.mp4 --prompt "person" --use-matanyone
 
   # Process PNG sequence
   %(prog)s --input /path/to/frames/ --prompt "person" --output ./output
 
-QUALITY PRESETS:
+PIPELINE PRESETS (recommended):
+  cinema   - Production quality: depth expansion + MatAnyone temporal
+  quick    - Fast single-frame preview
+
+QUALITY PRESETS (for fine-tuning):
   draft    - Fastest, small depth model
   standard - Balanced quality and speed (default)
   high     - Best quality, large depth model
@@ -58,6 +68,33 @@ QUALITY PRESETS:
     add_stage_control_args(parser)
     add_performance_args(parser)
     add_debug_args(parser)
+
+    # Pipeline preset (overrides quality settings)
+    parser.add_argument(
+        "--preset",
+        choices=["cinema", "quick"],
+        default=None,
+        help="Pipeline preset: cinema (production quality + temporal), quick (fast preview)"
+    )
+
+    # Depth expansion settings (for cinema preset or manual use)
+    parser.add_argument(
+        "--depth-expand",
+        action="store_true",
+        help="Enable depth-guided mask expansion"
+    )
+    parser.add_argument(
+        "--depth-expand-tolerance",
+        type=float,
+        default=0.1,
+        help="Depth expansion tolerance (0-1)"
+    )
+    parser.add_argument(
+        "--depth-expand-max-px",
+        type=int,
+        default=50,
+        help="Max expansion distance in pixels"
+    )
 
     # SAM settings
     parser.add_argument(
@@ -190,6 +227,43 @@ QUALITY PRESETS:
         help="MatAnyone repo path"
     )
 
+    # MatAnyone temporal propagation mode
+    parser.add_argument(
+        "--use-matanyone",
+        action="store_true",
+        help="Enable MatAnyone temporal mode: refine frame 1 only, propagate to all"
+    )
+    parser.add_argument(
+        "--matanyone-mem-every",
+        type=int,
+        default=3,
+        help="MatAnyone memory interval (lower=better, slower)"
+    )
+    parser.add_argument(
+        "--matanyone-max-mem-frames",
+        type=int,
+        default=10,
+        help="MatAnyone max memory frames (higher=better, more VRAM)"
+    )
+    parser.add_argument(
+        "--matanyone-warmup",
+        type=int,
+        default=5,
+        help="MatAnyone warmup frames"
+    )
+    parser.add_argument(
+        "--matanyone-erode",
+        type=int,
+        default=3,
+        help="MatAnyone mask erosion iterations"
+    )
+    parser.add_argument(
+        "--matanyone-dilate",
+        type=int,
+        default=5,
+        help="MatAnyone mask dilation iterations"
+    )
+
     return parser.parse_args()
 
 
@@ -212,9 +286,14 @@ def main():
         prompt=args.prompt or "",
         box=args.box if hasattr(args, 'box') and args.box else "",
         quality=args.quality,
+        preset=args.preset or "",
         device=args.device,
         output_format=args.format,
         bit_depth=args.bit_depth,
+        # Depth expansion settings
+        depth_expansion_enabled=args.depth_expand or (args.preset == "cinema"),
+        depth_expansion_tolerance=args.depth_expand_tolerance,
+        depth_expansion_max_px=args.depth_expand_max_px,
         # SAM settings
         sam_imgsz=args.sam_imgsz,
         sam_conf=args.sam_conf,
@@ -242,6 +321,13 @@ def main():
         refiner=args.refiner,
         mam2_checkpoint=args.mam2_checkpoint,
         mam2_repo=args.mam2_repo,
+        # MatAnyone temporal mode
+        use_matanyone=args.use_matanyone or (args.preset == "cinema"),
+        matanyone_mem_every=args.matanyone_mem_every,
+        matanyone_max_mem_frames=args.matanyone_max_mem_frames,
+        matanyone_warmup=args.matanyone_warmup,
+        matanyone_erode=args.matanyone_erode,
+        matanyone_dilate=args.matanyone_dilate,
     )
 
     # Create pipeline

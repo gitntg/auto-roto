@@ -38,6 +38,7 @@ class CombineStage(PipelineStage):
     def __init__(
         self,
         config: MatteCombineConfig = None,
+        first_frame_only: bool = False,
         logger: logging.Logger = None
     ):
         """
@@ -45,10 +46,12 @@ class CombineStage(PipelineStage):
 
         Args:
             config: MatteCombineConfig instance (uses defaults if None)
+            first_frame_only: If True, only process the first frame (for MatAnyone mode)
             logger: Optional logger instance
         """
         super().__init__(logger)
         self.config = config or MatteCombineConfig()
+        self.first_frame_only = first_frame_only
 
     @property
     def name(self) -> str:
@@ -131,6 +134,9 @@ class CombineStage(PipelineStage):
             )
 
         min_count = min(len(frame_files), len(alpha_files))
+        if self.first_frame_only:
+            min_count = min(min_count, 1)
+            self._logger.info("First frame only mode (for MatAnyone)")
         self._logger.info(f"Processing {min_count} frames")
 
         frame_count = 0
