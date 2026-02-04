@@ -1,0 +1,849 @@
+#!/usr/bin/env python
+"""
+AUTO-ROTO FULL PIPELINE v5
+==========================
+
+Production-grade automatic rotoscoping with professional quality enhancements.
+
+This is the main entry point for v5 which chains:
+    1. SAM2 segmentation (auto_roto.py)
+    2. Depth Anything V2 refinement (depth_refine.py)
+    3. Edge refinement (edge_refine.py) - NEW
+    4. Temporal coherence (temporal_smooth.py) - NEW
+    5. Matte combination (matte_combine.py) - NEW
+    6. (Optional) Hair refinement (hair_refine.py)
+
+NEW IN V5:
+- Professional edge refinement with subpixel precision
+- Temporal coherence to prevent flickering
+- Multi-layer matte combination
+- Color correction and despill
+- Proper premultiplied alpha compositing
+
+USAGE:
+    # Full pipeline with all enhancements
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output
+
+    # Quick mode (SAM2 + edge refinement only)
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quick
+
+    # High quality with temporal smoothing
+    python full_pipeline_v5.py --input video.mp4 --prompt "person" --output ./output --quality high
+
+    # Process PNG sequence
+    python full_pipeline_v5.py --input /path/to/frames/ --prompt "car" --output ./output
+
+Author: AUTO-ROTO v5
+License: MIT
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import shutil
+import gc
+import time
+import platform
+from pathlib import Path
+import logging
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass
+
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("FullPipelineV5")
+
+
+@dataclass
+class PipelineConfig:
+    """Configuration for the full pipeline."""
+
+    # Input/Output
+    input_path: str = ""
+    output_dir: str = "./output"
+
+    # Detection
+    prompt: str = ""
+    box: str = ""
+    interactive: bool = False
+
+    # Quality preset
+    quality: str = "standard"  # draft, standard, high, ultra
+
+    # Stage control
+    skip_sam: bool = False
+    skip_depth: bool = False
+    skip_vitmatte: bool = False  # ViTMatte alpha refinement
+    skip_edge: bool = False
+    skip_temporal: bool = False
+    skip_combine: bool = False
+    skip_hair: bool = True  # Hair refinement optional, off by default
+
+    # ViTMatte settings (adaptive trimap)
+    vitmatte_motion_aware: bool = False
+    vitmatte_adaptive_base: float = 2.0
+    vitmatte_adaptive_max: float = 60.0
+
+    # Model sizes (auto-set by quality preset)
+    sam_model: str = ""
+    depth_model: str = ""
+
+    # DA3 Depth Sensitivity Settings (NEW)
+    depth_process_res: int = None         # None = auto, or explicit value like 1024, 2048
+    depth_process_method: str = "upper"   # "upper" or "lower" bound resize
+    depth_norm_percentiles: tuple = (2.0, 98.0)  # Normalization percentiles
+    use_depth_confidence: bool = False     # Use DA3 confidence maps
+
+    # Edge refinement
+    edge_softness: float = 1.0
+    core_shrink: int = 3
+    despill_strength: float = 0.5
+
+    # Temporal smoothing
+    temporal_window: int = 5
+    keyframe_interval: int = 30
+
+    # Output settings
+    output_format: str = "exr"
+    bit_depth: int = 16
+
+    # Performance
+    device: str = "cuda"
+    no_compile: bool = False
+    force_compile: bool = False  # Force torch.compile even on unsupported platforms
+
+    # Debug
+    verbose: bool = False
+    keep_intermediate: bool = False
+
+
+def get_quality_preset(quality: str) -> Dict[str, Any]:
+    """Get model sizes and settings for quality preset."""
+    presets = {
+        'draft': {
+            'sam_model': 'tiny',
+            'depth_model': 'small',
+            'temporal_window': 3,
+            'edge_softness': 0.5,
+            # DA3 settings: fast, basic detail
+            'depth_process_res': None,  # auto (image size)
+            'depth_process_method': 'upper',
+            'depth_norm_percentiles': (2.0, 98.0),
+        },
+        'standard': {
+            'sam_model': 'base_plus',
+            'depth_model': 'base',
+            'temporal_window': 5,
+            'edge_softness': 1.0,
+            # DA3 settings: balanced
+            'depth_process_res': None,  # auto
+            'depth_process_method': 'upper',
+            'depth_norm_percentiles': (2.0, 98.0),
+        },
+        'high': {
+            'sam_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
+            'temporal_window': 7,
+            'edge_softness': 1.5,
+            # DA3 settings: optimized for fine detail
+            'depth_process_res': None,  # auto (but lower_bound gives higher effective res)
+            'depth_process_method': 'lower',  # Higher effective resolution for hair
+            'depth_norm_percentiles': (1.0, 99.0),  # Wider range preserves more detail
+        },
+        'ultra': {
+            'sam_model': 'large',
+            'depth_model': 'large',  # DA3Mono-Large preserves hair detail (not nested!)
+            'temporal_window': 9,
+            'edge_softness': 2.0,
+            # DA3 settings: maximum detail capture
+            'depth_process_res': 2048,  # Explicit high resolution
+            'depth_process_method': 'lower',  # process_res is min dimension
+            'depth_norm_percentiles': (0.5, 99.5),  # Widest range for subtle details
+        }
+    }
+    return presets.get(quality, presets['standard'])
+
+
+def should_disable_compile() -> bool:
+    """Check if torch.compile should be disabled by default.
+
+    torch.compile requires triton on Windows. With PyTorch 2.7+ and
+    triton-windows 3.3+, torch.compile works correctly.
+    Returns True only if on Windows without triton.
+    """
+    if platform.system() == "Windows":
+        try:
+            import triton
+            # triton-windows available - torch.compile should work
+            return False
+        except ImportError:
+            # No triton on Windows - disable compile
+            return True
+    return False
+
+
+def find_script(name: str) -> Path:
+    """Find a script in the same directory."""
+    script_dir = Path(__file__).parent
+    script_path = script_dir / name
+
+    if script_path.exists():
+        return script_path
+
+    raise FileNotFoundError(f"Cannot find {name} in {script_dir}")
+
+
+def clear_gpu_memory():
+    """Clear GPU memory between stages."""
+    try:
+        import torch
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    except ImportError:
+        pass
+
+    gc.collect()
+    logger.debug("GPU memory cleared")
+
+
+def run_stage(cmd: list, stage_name: str, verbose: bool = False) -> bool:
+    """Run a pipeline stage and return success status."""
+    logger.info(f"\n{'='*60}")
+    logger.info(f"STAGE: {stage_name}")
+    logger.info(f"{'='*60}")
+
+    if verbose:
+        logger.info(f"Command: {' '.join(cmd)}")
+
+    start_time = time.time()
+
+    try:
+        result = subprocess.run(
+            cmd,
+            check=True,
+            text=True,
+            capture_output=not verbose
+        )
+
+        duration = time.time() - start_time
+        logger.info(f"  {stage_name} completed in {duration:.1f}s")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"  {stage_name} failed with exit code {e.returncode}")
+        if e.stderr:
+            logger.error(f"  Error: {e.stderr[:500]}")
+        return False
+
+
+def run_python_stage(
+    script_path: Path,
+    args: List[str],
+    stage_name: str,
+    verbose: bool = False
+) -> bool:
+    """Run a Python script as a pipeline stage."""
+    cmd = [sys.executable, str(script_path)] + args
+    return run_stage(cmd, stage_name, verbose)
+
+
+def run_pipeline(config: PipelineConfig):
+    """Run the full v5 pipeline."""
+
+    # Apply quality preset
+    preset = get_quality_preset(config.quality)
+    if not config.sam_model:
+        config.sam_model = preset['sam_model']
+    if not config.depth_model:
+        config.depth_model = preset['depth_model']
+    if config.temporal_window == 5:  # Default
+        config.temporal_window = preset['temporal_window']
+    if config.edge_softness == 1.0:  # Default
+        config.edge_softness = preset['edge_softness']
+    # Apply DA3 depth sensitivity settings from preset (unless overridden)
+    if config.depth_process_res is None and 'depth_process_res' in preset:
+        config.depth_process_res = preset['depth_process_res']
+    if config.depth_process_method == "upper" and 'depth_process_method' in preset:
+        config.depth_process_method = preset['depth_process_method']
+    if config.depth_norm_percentiles == (2.0, 98.0) and 'depth_norm_percentiles' in preset:
+        config.depth_norm_percentiles = preset['depth_norm_percentiles']
+
+    # Auto-disable torch.compile on Windows without triton
+    if not config.no_compile and not config.force_compile and should_disable_compile():
+        logger.info("Windows without triton - disabling torch.compile")
+        logger.info("  Install triton-windows for compilation: pip install triton-windows>=3.3")
+        config.no_compile = True
+
+    # Setup directories
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Intermediate directories
+    sam_output = output_dir / "01_sam_output"
+    depth_output = output_dir / "02_depth_output"
+    vitmatte_output = output_dir / "03_vitmatte_output"
+    edge_output = output_dir / "04_edge_output"
+    temporal_output = output_dir / "05_temporal_output"
+    combine_output = output_dir / "06_combine_output"
+    final_output = output_dir / "final"
+
+    # Find scripts
+    script_dir = Path(__file__).parent
+
+    pipeline_start = time.time()
+
+    logger.info("="*60)
+    logger.info("AUTO-ROTO v5 PIPELINE")
+    logger.info("="*60)
+    logger.info(f"Input: {config.input_path}")
+    logger.info(f"Output: {config.output_dir}")
+    logger.info(f"Quality: {config.quality}")
+    logger.info(f"SAM Model: {config.sam_model}")
+    logger.info(f"Depth Model: {config.depth_model}")
+    logger.info("="*60)
+
+    # =========================================================================
+    # STAGE 1: SAM2 Segmentation
+    # =========================================================================
+    if not config.skip_sam:
+        auto_roto_script = find_script("auto_roto.py")
+
+        sam_args = [
+            "--input", config.input_path,
+            "--output", str(sam_output),
+            "--sam-model", config.sam_model,
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+            "--no-refine",  # We'll do our own refinement
+        ]
+
+        if config.prompt:
+            sam_args.extend(["--prompt", config.prompt])
+        elif config.box:
+            sam_args.extend(["--box", config.box])
+        if config.interactive:
+            sam_args.append("--interactive")
+
+        if config.no_compile:
+            sam_args.append("--no-compile")
+
+        if config.verbose:
+            sam_args.append("--verbose")
+
+        success = run_python_stage(
+            auto_roto_script, sam_args,
+            "SAM2 Segmentation", config.verbose
+        )
+
+        if not success:
+            logger.error("Pipeline failed at SAM2 stage")
+            return False
+
+        clear_gpu_memory()
+    else:
+        logger.info("Skipping SAM2 (--skip-sam)")
+
+    # =========================================================================
+    # STAGE 2: Depth Refinement
+    # =========================================================================
+    if not config.skip_depth:
+        depth_script = find_script("depth_refine.py")
+
+        # Determine alpha source
+        alpha_source = sam_output / "alpha"
+        if not alpha_source.exists():
+            logger.warning(f"Alpha dir not found: {alpha_source}")
+            alpha_source = sam_output
+
+        depth_args = [
+            "--alpha", str(alpha_source),
+            "--frames", config.input_path,
+            "--output", str(depth_output),
+            "--depth-model", config.depth_model,
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+            # DA3 sensitivity settings
+            "--depth-method", config.depth_process_method,
+            "--depth-percentiles", str(config.depth_norm_percentiles[0]),
+            str(config.depth_norm_percentiles[1]),
+        ]
+
+        # Add optional depth_process_res if explicitly set
+        if config.depth_process_res is not None:
+            depth_args.extend(["--depth-res", str(config.depth_process_res)])
+
+        # Add confidence flag if enabled
+        if config.use_depth_confidence:
+            depth_args.append("--use-depth-confidence")
+
+        if config.verbose:
+            depth_args.extend(["--verbose", "--debug"])
+
+        success = run_python_stage(
+            depth_script, depth_args,
+            "Depth Refinement", config.verbose
+        )
+
+        if not success:
+            logger.warning("Depth refinement failed, continuing with SAM output")
+            depth_output = sam_output
+
+        clear_gpu_memory()
+    else:
+        logger.info("Skipping Depth Refinement (--skip-depth)")
+        depth_output = sam_output
+
+    # =========================================================================
+    # STAGE 3: ViTMatte Alpha Refinement (Adaptive Trimap)
+    # =========================================================================
+    if not config.skip_vitmatte:
+        vitmatte_script = find_script("vitmatte_refine.py")
+
+        # Determine sources
+        sam_alpha = sam_output / "alpha"
+        if not sam_alpha.exists():
+            sam_alpha = sam_output
+
+        depth_maps = depth_output / "depth"
+        if not depth_maps.exists():
+            depth_maps = depth_output
+
+        vitmatte_args = [
+            "--sam-mask", str(sam_alpha),
+            "--depth", str(depth_maps),
+            "--frames", config.input_path,
+            "--output", str(vitmatte_output),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+            "--core-erosion", "10",
+            "--adaptive-base", str(config.vitmatte_adaptive_base),
+            "--adaptive-max", str(config.vitmatte_adaptive_max),
+            "--save-trimap",
+        ]
+
+        if config.vitmatte_motion_aware:
+            vitmatte_args.append("--motion-aware")
+
+        if config.verbose:
+            vitmatte_args.append("--verbose")
+
+        success = run_python_stage(
+            vitmatte_script, vitmatte_args,
+            "ViTMatte Alpha Refinement", config.verbose
+        )
+
+        if not success:
+            logger.warning("ViTMatte refinement failed, continuing with depth output")
+            vitmatte_output = depth_output
+
+        clear_gpu_memory()
+    else:
+        logger.info("Skipping ViTMatte (--skip-vitmatte)")
+        vitmatte_output = depth_output
+
+    # =========================================================================
+    # STAGE 4: Edge Refinement
+    # =========================================================================
+    if not config.skip_edge:
+        edge_script = find_script("edge_refine.py")
+
+        # Determine alpha source (now from ViTMatte)
+        alpha_source = vitmatte_output / "alpha"
+        if not alpha_source.exists():
+            alpha_source = vitmatte_output
+
+        edge_args = [
+            "--alpha", str(alpha_source),
+            "--output", str(edge_output),
+            "--frames", config.input_path,
+            "--softness", str(config.edge_softness),
+            "--core-shrink", str(config.core_shrink),
+            "--despill", str(config.despill_strength),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+        ]
+
+        if config.verbose:
+            edge_args.append("--verbose")
+
+        success = run_python_stage(
+            edge_script, edge_args,
+            "Edge Refinement", config.verbose
+        )
+
+        if not success:
+            logger.warning("Edge refinement failed, continuing with previous output")
+            edge_output = vitmatte_output
+
+        clear_gpu_memory()  # Clean up after Edge Refinement
+    else:
+        logger.info("Skipping Edge Refinement (--skip-edge)")
+        edge_output = vitmatte_output
+
+    # =========================================================================
+    # STAGE 5: Temporal Smoothing
+    # =========================================================================
+    if not config.skip_temporal:
+        temporal_script = find_script("temporal_smooth.py")
+
+        # Determine alpha source
+        alpha_source = edge_output / "alpha"
+        if not alpha_source.exists():
+            alpha_source = edge_output
+
+        temporal_args = [
+            "--alpha", str(alpha_source),
+            "--output", str(temporal_output),
+            "--frames", config.input_path,
+            "--window", str(config.temporal_window),
+            "--keyframe-interval", str(config.keyframe_interval),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+        ]
+
+        if config.verbose:
+            temporal_args.append("--verbose")
+
+        success = run_python_stage(
+            temporal_script, temporal_args,
+            "Temporal Smoothing", config.verbose
+        )
+
+        if not success:
+            logger.warning("Temporal smoothing failed, continuing with previous output")
+            temporal_output = edge_output
+
+        clear_gpu_memory()  # Clean up after Temporal Smoothing
+    else:
+        logger.info("Skipping Temporal Smoothing (--skip-temporal)")
+        temporal_output = edge_output
+
+    # =========================================================================
+    # STAGE 6: Matte Combination
+    # =========================================================================
+    if not config.skip_combine:
+        combine_script = find_script("matte_combine.py")
+
+        # Determine alpha source
+        alpha_source = temporal_output / "alpha"
+        if not alpha_source.exists():
+            alpha_source = temporal_output
+
+        combine_args = [
+            "--alpha", str(alpha_source),
+            "--output", str(combine_output),
+            "--frames", config.input_path,
+            "--core-erosion", str(config.core_shrink),
+            "--despill", str(config.despill_strength),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+        ]
+
+        if config.verbose:
+            combine_args.append("--verbose")
+
+        success = run_python_stage(
+            combine_script, combine_args,
+            "Matte Combination", config.verbose
+        )
+
+        if not success:
+            logger.warning("Matte combination failed, using previous output")
+            combine_output = temporal_output
+
+        clear_gpu_memory()  # Clean up after Matte Combination
+    else:
+        logger.info("Skipping Matte Combination (--skip-combine)")
+        combine_output = temporal_output
+
+    # =========================================================================
+    # STAGE 7: Hair Refinement (Using Adaptive ViTMatte)
+    # =========================================================================
+    if not config.skip_hair:
+        # POINT TO THE NEW SCRIPT
+        hair_script = find_script("vitmatte_refine.py")
+
+        # Determine inputs
+        # 1. We need the original SAM mask (best source for core)
+        sam_alpha = sam_output / "alpha"
+        if not sam_alpha.exists():
+            # Fallback to whatever alpha we have currently
+            sam_alpha = alpha_source
+
+        # 2. We need depth maps
+        depth_maps = depth_output / "depth"
+        if not depth_maps.exists():
+            logger.warning("No depth maps found for hair refinement!")
+            # In a real fix, you might want to skip or fail here
+
+        hair_output = output_dir / "07_hair_output"
+
+        # USE THE NEW ARGUMENTS
+        hair_args = [
+            "--sam-mask", str(sam_alpha),
+            "--depth", str(depth_maps),
+            "--frames", config.input_path,
+            "--output", str(hair_output),
+            "--format", config.output_format,
+            "--bit-depth", str(config.bit_depth),
+            "--adaptive-base", "2.0",
+            "--adaptive-max", "60.0",
+            "--motion-aware", # Enable the motion logic
+            "--save-trimap",
+        ]
+
+        # Only run if we have frames (vitmatte needs frames folder, not video file)
+        # Note: If input is a video file, you might need to point to the
+        # temp frames extracted in Stage 1/2 if they exist, or extract them.
+        # Assuming input_path is a sequence or we have temp frames:
+
+        success = run_python_stage(
+            hair_script, hair_args,
+            "Hair Refinement (Adaptive)", config.verbose
+        )
+
+        if success:
+            combine_output = hair_output
+
+        clear_gpu_memory()
+    else:
+        logger.debug("Skipping Hair Refinement (default off)")
+
+    # =========================================================================
+    # FINAL: Copy to output
+    # =========================================================================
+    logger.info("\n" + "="*60)
+    logger.info("FINALIZING OUTPUT")
+    logger.info("="*60)
+
+    final_output.mkdir(parents=True, exist_ok=True)
+
+    # Find the last successful output
+    final_source = combine_output
+
+    # Copy final results
+    for subdir in ["alpha", "rgb", "rgba", "preview"]:
+        src = final_source / subdir
+        if src.exists():
+            dst = final_output / subdir
+            if dst.exists():
+                shutil.rmtree(dst)
+            shutil.copytree(src, dst)
+            logger.info(f"  Copied {subdir}/ to final output")
+
+    # Cleanup intermediate if not keeping
+    if not config.keep_intermediate:
+        logger.info("Cleaning up intermediate files...")
+        for intermediate in [sam_output, depth_output, vitmatte_output, edge_output,
+                           temporal_output, combine_output]:
+            if intermediate.exists() and intermediate != final_output:
+                shutil.rmtree(intermediate, ignore_errors=True)
+
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    total_time = time.time() - pipeline_start
+
+    logger.info("\n" + "="*60)
+    logger.info("PIPELINE COMPLETE")
+    logger.info("="*60)
+    logger.info(f"Total time: {total_time/60:.1f} minutes")
+    logger.info(f"Output: {final_output}")
+    logger.info("")
+    logger.info("Output structure:")
+
+    for subdir in ["alpha", "rgb", "rgba", "preview", "depth"]:
+        subpath = final_output / subdir
+        if subpath.exists():
+            count = len(list(subpath.glob("*")))
+            logger.info(f"  {subdir}/  ({count} files)")
+
+    logger.info("="*60)
+
+    return True
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="AUTO-ROTO v5: Production-grade automatic rotoscoping",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES:
+  # Full quality pipeline
+  %(prog)s --input video.mp4 --prompt "person" --output ./output
+
+  # Process PNG sequence with high quality
+  %(prog)s --input /path/to/frames/ --prompt "car" --output ./output --quality high
+
+  # Quick mode (SAM2 + edge only)
+  %(prog)s --input video.mp4 --prompt "person" --output ./output --quality draft --skip-temporal
+
+  # Interactive selection
+  %(prog)s --input video.mp4 --interactive --output ./output
+
+QUALITY PRESETS:
+  draft    - Fastest, tiny/small models
+  standard - Balanced quality and speed (default)
+  high     - Best quality, large models
+  ultra    - Maximum quality, longer temporal window
+        """
+    )
+
+    # Input/Output
+    parser.add_argument("--input", "-i", required=True,
+                       help="Input video or image sequence directory")
+    parser.add_argument("--output", "-o", default="./output",
+                       help="Output directory")
+
+    # Prompt type
+    prompt_group = parser.add_mutually_exclusive_group(required=True)
+    prompt_group.add_argument("--prompt", "-p",
+                             help="Text prompt for detection")
+    prompt_group.add_argument("--box", "-b",
+                             help="Box prompt: x1,y1,x2,y2")
+    prompt_group.add_argument("--interactive", action="store_true",
+                             help="Interactive selection")
+
+    # Quality
+    parser.add_argument("--quality", "-q",
+                       choices=["draft", "standard", "high", "ultra"],
+                       default="standard",
+                       help="Quality preset (default: standard)")
+
+    # Stage control
+    parser.add_argument("--skip-sam", action="store_true",
+                       help="Skip SAM2 (use existing alpha)")
+    parser.add_argument("--skip-depth", action="store_true",
+                       help="Skip depth refinement")
+    parser.add_argument("--skip-vitmatte", action="store_true",
+                       help="Skip ViTMatte alpha refinement")
+    parser.add_argument("--skip-edge", action="store_true",
+                       help="Skip edge refinement")
+    parser.add_argument("--skip-temporal", action="store_true",
+                       help="Skip temporal smoothing")
+    parser.add_argument("--skip-combine", action="store_true",
+                       help="Skip matte combination")
+    parser.add_argument("--with-hair", action="store_true",
+                       help="Enable hair refinement (off by default)")
+
+    # Advanced
+    parser.add_argument("--sam-model",
+                       choices=["tiny", "small", "base_plus", "large"],
+                       help="Override SAM2 model size")
+    parser.add_argument("--depth-model",
+                       choices=["small", "base", "large", "nested-base", "nested-large"],
+                       help="Override Depth model (large=DA3Mono best for hair detail)")
+
+    # DA3 Depth Sensitivity Settings (NEW)
+    parser.add_argument("--depth-res", type=int, default=None,
+                       help="DA3 processing resolution (default: auto). "
+                            "Higher values (1024, 2048) capture finer hair details")
+    parser.add_argument("--depth-method", type=str, default="upper",
+                       choices=["upper", "lower"],
+                       help="DA3 resize method: 'lower' gives higher effective resolution")
+    parser.add_argument("--depth-percentiles", type=float, nargs=2, default=[2.0, 98.0],
+                       metavar=("LOW", "HIGH"),
+                       help="Depth normalization percentiles. Wider (1 99) preserves more detail")
+    parser.add_argument("--use-depth-confidence", action="store_true",
+                       help="Use DA3 confidence maps for semi-transparent edges")
+
+    # ViTMatte settings (adaptive trimap)
+    parser.add_argument("--vitmatte-motion", action="store_true",
+                       help="Enable motion-aware trimap for ViTMatte")
+    parser.add_argument("--vitmatte-base", type=float, default=2.0,
+                       help="Min unknown width for smooth regions (default: 2)")
+    parser.add_argument("--vitmatte-max", type=float, default=60.0,
+                       help="Max unknown width for complex regions (default: 60)")
+
+    # Edge settings
+    parser.add_argument("--edge-softness", type=float, default=1.0,
+                       help="Edge softness (default: 1.0)")
+    parser.add_argument("--core-shrink", type=int, default=3,
+                       help="Core shrink pixels (default: 3)")
+    parser.add_argument("--despill", type=float, default=0.5,
+                       help="Despill strength (default: 0.5)")
+
+    # Temporal settings
+    parser.add_argument("--temporal-window", type=int, default=5,
+                       help="Temporal window size (default: 5)")
+    parser.add_argument("--keyframe-interval", type=int, default=30,
+                       help="Keyframe interval (default: 30)")
+
+    # Output format
+    parser.add_argument("--format", default="exr",
+                       choices=["exr", "png", "tiff"])
+    parser.add_argument("--bit-depth", type=int, default=16,
+                       choices=[8, 16, 32])
+
+    # Performance
+    parser.add_argument("--device", default="cuda", help="Device (cuda/cpu)")
+    parser.add_argument("--no-compile", action="store_true",
+                       help="Disable SAM2 model compilation (auto-enabled on Windows)")
+    parser.add_argument("--force-compile", action="store_true",
+                       help="Force torch.compile even on Windows (may fail)")
+
+    # Debug
+    parser.add_argument("--verbose", "-v", action="store_true",
+                       help="Verbose output")
+    parser.add_argument("--keep-intermediate", action="store_true",
+                       help="Keep intermediate files")
+
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+
+    config = PipelineConfig(
+        input_path=args.input,
+        output_dir=args.output,
+        prompt=args.prompt or "",
+        box=args.box or "",
+        interactive=args.interactive,
+        quality=args.quality,
+        skip_sam=args.skip_sam,
+        skip_depth=args.skip_depth,
+        skip_vitmatte=args.skip_vitmatte,
+        skip_edge=args.skip_edge,
+        skip_temporal=args.skip_temporal,
+        skip_combine=args.skip_combine,
+        skip_hair=not args.with_hair,
+        sam_model=args.sam_model or "",
+        depth_model=args.depth_model or "",
+        # DA3 depth sensitivity settings
+        depth_process_res=args.depth_res,
+        depth_process_method=args.depth_method,
+        depth_norm_percentiles=tuple(args.depth_percentiles),
+        use_depth_confidence=args.use_depth_confidence,
+        # ViTMatte settings
+        vitmatte_motion_aware=args.vitmatte_motion,
+        vitmatte_adaptive_base=args.vitmatte_base,
+        vitmatte_adaptive_max=args.vitmatte_max,
+        edge_softness=args.edge_softness,
+        core_shrink=args.core_shrink,
+        despill_strength=args.despill,
+        temporal_window=args.temporal_window,
+        keyframe_interval=args.keyframe_interval,
+        output_format=args.format,
+        bit_depth=args.bit_depth,
+        device=args.device,
+        no_compile=args.no_compile,
+        force_compile=args.force_compile,
+        verbose=args.verbose,
+        keep_intermediate=args.keep_intermediate,
+    )
+
+    success = run_pipeline(config)
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
