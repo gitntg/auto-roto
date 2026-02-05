@@ -211,9 +211,37 @@ class InteractiveMatAnyonePipeline:
                     final_mask_path = mask_path
 
             # =====================================================================
+            # MANUAL REFINEMENT STEP (after all AI processing, before MatAnyone)
+            # =====================================================================
+            # Load the current mask as numpy array for the editor
+            if self.use_cinema_preset and final_mask_path != mask_path:
+                # Cinema mode: read back the refined mask from disk
+                refined_mask_img = cv2.imread(str(final_mask_path), cv2.IMREAD_GRAYSCALE)
+                current_mask_array = refined_mask_img.astype(np.float32) / 255.0
+            else:
+                current_mask_array = np.squeeze(approved_mask)
+
+            manual_choice = self._offer_final_review(
+                first_frame, current_mask_array, output_path
+            )
+
+            if manual_choice == "quit":
+                self._logger.info("Pipeline cancelled by user")
+                return False
+            elif manual_choice == "refined":
+                # Mask was updated in-place, save it
+                manual_mask_path = output_path / "manual_refined_mask.png"
+                cv2.imwrite(
+                    str(manual_mask_path),
+                    (current_mask_array * 255).astype(np.uint8),
+                )
+                final_mask_path = manual_mask_path
+                self._logger.info(f"  Manual refinement saved: {manual_mask_path}")
+
+            # =====================================================================
             # FINAL STEP: Run MatAnyone
             # =====================================================================
-            step_num = 6 if self.use_cinema_preset else 3
+            step_num = 7 if self.use_cinema_preset else 4
             self._logger.info(f"\n[Step {step_num}] Running MatAnyone...")
 
             success = self._run_matanyone(input_path, final_mask_path, output_path)
@@ -574,7 +602,7 @@ class InteractiveMatAnyonePipeline:
                     save_trimap_path=trimap_path
                 )
 
-                current_mask = refined_alpha
+                current_mask = np.squeeze(refined_alpha)
                 self._logger.info("  ViTMatte refinement complete")
 
                 refiner.release()
@@ -607,11 +635,12 @@ class InteractiveMatAnyonePipeline:
         alpha: float = 0.5
     ) -> np.ndarray:
         """Create preview with mask overlay."""
-        # Green overlay for mask
         overlay = frame.copy().astype(np.float32)
         green = np.array([0, 255, 0], dtype=np.float32)
 
-        mask_3ch = mask[:, :, np.newaxis]
+        # Ensure mask is 2D (H, W) - squeeze any extra dims from ViTMatte etc.
+        mask_2d = np.squeeze(mask)
+        mask_3ch = mask_2d[:, :, np.newaxis]
         overlay = overlay * (1 - mask_3ch * alpha) + green * mask_3ch * alpha
 
         return overlay.astype(np.uint8)
@@ -637,10 +666,15 @@ class InteractiveMatAnyonePipeline:
 
     def _get_user_choice(self) -> str:
         """Get user choice from terminal."""
+        if self.use_cinema_preset:
+            next_step = "cinema refinement (Depth + ViTMatte)"
+        else:
+            next_step = "final review"
+
         print("\n" + "=" * 50)
-        print("REVIEW FIRST-FRAME MASK")
+        print("REVIEW FIRST-FRAME SAM3 MASK")
         print("=" * 50)
-        print("  [A] Accept - proceed to MatAnyone")
+        print(f"  [A] Accept - proceed to {next_step}")
         print("  [F] Fill holes - fill interior gaps in mask")
         print("  [P] Add prompt - add text prompts (e.g. 'hair', 'arm')")
         print("  [S] More sensitive - lower confidence threshold")
@@ -758,6 +792,79 @@ class InteractiveMatAnyonePipeline:
                 pass
 
         return include_points, exclude_points
+
+    def _offer_final_review(
+        self,
+        frame: np.ndarray,
+        mask: np.ndarray,
+        output_path: Path,
+    ) -> str:
+        """
+        Show the final mask and offer accept / manual refine / quit.
+
+        If the user chooses manual refine, opens the MaskRefinementEditor.
+        The mask array is updated in-place if refined.
+
+        Returns:
+            "accept", "refined", or "quit"
+        """
+        import cv2
+
+        # Show preview
+        preview = self._create_preview(frame, mask)
+        preview_path = output_path / "preview_final_mask.png"
+        cv2.imwrite(str(preview_path), cv2.cvtColor(preview, cv2.COLOR_RGB2BGR))
+        self._open_preview(preview_path)
+
+        while True:
+            print("\n" + "=" * 50)
+            print("FINAL MASK REVIEW (before MatAnyone)")
+            print("=" * 50)
+            print("  [A] Accept - proceed to MatAnyone")
+            print("  [M] Manual refine - open drawing tools (brush/eraser/bezier)")
+            print("  [Q] Quit - cancel pipeline")
+            print("=" * 50)
+
+            try:
+                choice = input("Your choice (A/M/Q): ").strip().upper()
+            except (KeyboardInterrupt, EOFError):
+                print("\n")
+                return "quit"
+
+            if choice in ("A", "ACCEPT"):
+                return "accept"
+
+            elif choice in ("M", "MANUAL"):
+                from auto_roto.utils.mask_editor import MaskRefinementEditor
+
+                self._logger.info("  Opening manual mask editor...")
+                mask_2d = np.squeeze(mask)
+                editor = MaskRefinementEditor(frame, mask_2d)
+                result = editor.run()
+
+                if result is not None:
+                    mask_2d[:] = result
+                    # Copy back into original array (handles any shape)
+                    np.copyto(mask, mask_2d.reshape(mask.shape))
+                    self._logger.info("  Manual refinement applied")
+
+                    # Update preview after edit
+                    preview = self._create_preview(frame, mask)
+                    cv2.imwrite(
+                        str(preview_path),
+                        cv2.cvtColor(preview, cv2.COLOR_RGB2BGR),
+                    )
+                    self._open_preview(preview_path)
+                    return "refined"
+                else:
+                    self._logger.info("  Manual edit cancelled, back to review")
+                    # Loop back to menu
+
+            elif choice in ("Q", "QUIT", "EXIT"):
+                return "quit"
+
+            else:
+                print("Invalid choice. Please enter A, M, or Q.")
 
     def _run_matanyone(
         self,

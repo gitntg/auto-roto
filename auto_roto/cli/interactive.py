@@ -72,8 +72,8 @@ MATANYONE SETTINGS (auto-detected by resolution):
     parser.add_argument(
         "--preset",
         choices=["standard", "cinema"],
-        default="standard",
-        help="Pipeline preset: standard (SAM->MatAnyone) or cinema (full refinement)"
+        default="cinema",
+        help="Pipeline preset: cinema (full refinement, default) or standard (SAM->MatAnyone, faster)"
     )
 
     # Prompt

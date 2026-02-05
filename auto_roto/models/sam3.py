@@ -519,9 +519,10 @@ class SAM3Segmenter:
             text_prompts: List of text descriptions
 
         Yields:
-            (frame_idx, mask) tuples
+            (frame_idx, mask) tuples where frame_idx is extracted from filename
         """
         import cv2
+        import re
 
         frames_path = Path(frames_dir)
 
@@ -535,11 +536,16 @@ class SAM3Segmenter:
 
         self.logger.info(f"Processing {len(frame_files)} frames from {frames_dir}")
 
-        for idx, frame_path in enumerate(frame_files):
+        for list_idx, frame_path in enumerate(frame_files):
+            # Extract frame index from filename (e.g., "frame_125344.png" -> 125344)
+            # Falls back to list index if no number found
+            match = re.search(r'(\d+)', frame_path.stem)
+            frame_idx = int(match.group(1)) if match else list_idx
+
             frame = cv2.imread(str(frame_path))
             if frame is None:
                 self.logger.warning(f"Could not read frame: {frame_path}")
-                yield idx, None
+                yield frame_idx, None
                 continue
 
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -549,12 +555,12 @@ class SAM3Segmenter:
                 combined = np.zeros(frame.shape[:2], dtype=np.float32)
                 for mask in masks:
                     combined = np.maximum(combined, mask.astype(np.float32))
-                yield idx, combined
+                yield frame_idx, combined
             else:
-                yield idx, None
+                yield frame_idx, None
 
-            if idx % 10 == 0:
-                self.logger.info(f"  Processed frame {idx}/{len(frame_files)}")
+            if list_idx % 10 == 0:
+                self.logger.info(f"  Processed frame {list_idx + 1}/{len(frame_files)} (idx: {frame_idx})")
 
     def release(self) -> None:
         """Release models and free GPU memory."""

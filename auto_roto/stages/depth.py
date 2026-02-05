@@ -142,13 +142,20 @@ class DepthStage(PipelineStage):
 
             else:
                 # Frames directory
+                import re
+
                 frame_files = sorted(
                     list(frames_dir.glob("*.png")) +
                     list(frames_dir.glob("*.jpg")) +
                     list(frames_dir.glob("*.jpeg"))
                 )
 
-                for idx, frame_path in enumerate(frame_files):
+                for list_idx, frame_path in enumerate(frame_files):
+                    # Extract frame index from filename (e.g., "frame_125344.png" -> 125344)
+                    # Falls back to list index if no number found
+                    match = re.search(r'(\d+)', frame_path.stem)
+                    frame_idx = int(match.group(1)) if match else list_idx
+
                     # Read frame
                     frame = cv2.imread(str(frame_path))
                     if frame is None:
@@ -160,13 +167,13 @@ class DepthStage(PipelineStage):
                     depth = estimator.estimate(rgb)
 
                     # Save depth (raw DA3 output, unnormalized)
-                    depth_out_path = depth_dir / f"depth.{idx:04d}.exr"
+                    depth_out_path = depth_dir / f"depth.{frame_idx:04d}.exr"
                     save_depth_float(depth_out_path, depth)
 
-                    if idx % 10 == 0:
-                        self._logger.info(f"  Frame {idx}/{len(frame_files)}")
+                    if list_idx % 10 == 0:
+                        self._logger.info(f"  Frame {list_idx + 1}/{len(frame_files)} (idx: {frame_idx})")
 
-                    frame_count = idx + 1
+                    frame_count = list_idx + 1
 
                     if self.first_frame_only:
                         break

@@ -139,37 +139,44 @@ class CombineStage(PipelineStage):
             self._logger.info("First frame only mode (for MatAnyone)")
         self._logger.info(f"Processing {min_count} frames")
 
+        import re
+
         frame_count = 0
 
-        for idx in range(min_count):
+        for list_idx in range(min_count):
+            # Extract frame index from filename (e.g., "frame_125344.png" -> 125344)
+            # Falls back to list index if no number found
+            match = re.search(r'(\d+)', frame_files[list_idx].stem)
+            frame_idx = int(match.group(1)) if match else list_idx
+
             # Load inputs
-            frame = cv2.imread(str(frame_files[idx]))
+            frame = cv2.imread(str(frame_files[list_idx]))
             if frame is None:
                 continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            alpha = load_alpha(alpha_files[idx])
+            alpha = load_alpha(alpha_files[list_idx])
 
             # Process frame
             result = combiner.combine(rgb, alpha)
 
-            # Save outputs
+            # Save outputs with original frame index preserved
             # Alpha
-            alpha_path = alpha_out_dir / f"alpha.{idx:04d}.{output_format}"
+            alpha_path = alpha_out_dir / f"alpha.{frame_idx:04d}.{output_format}"
             save_alpha(alpha_path, result["alpha"], bit_depth=bit_depth)
 
             # RGBA
-            rgba_path = rgba_dir / f"rgba.{idx:04d}.{output_format}"
+            rgba_path = rgba_dir / f"rgba.{frame_idx:04d}.{output_format}"
             self._save_rgba(rgba_path, result["rgba"], output_format, bit_depth)
 
             # Preview
-            preview_path = preview_dir / f"preview.{idx:04d}.png"
+            preview_path = preview_dir / f"preview.{frame_idx:04d}.png"
             self._save_preview(preview_path, result["preview"])
 
-            frame_count = idx + 1
+            frame_count = list_idx + 1
 
-            if idx % 10 == 0:
-                self._logger.info(f"  Frame {idx}/{min_count}")
+            if list_idx % 10 == 0:
+                self._logger.info(f"  Frame {list_idx + 1}/{min_count} (idx: {frame_idx})")
 
         self._logger.info(f"Combined {frame_count} frames")
 
